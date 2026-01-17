@@ -1,0 +1,19 @@
+[Unit]
+Description=Chrony Time Sync Monitor
+After=chrony.service
+Wants=chrony.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m chrony_monitor
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Run as non-root user if desired
+# User=ops
+# Group=ops
+
+[Install]
+WantedBy=multi-user.target

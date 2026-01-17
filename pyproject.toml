@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chrony-monitor"
+version = "1.0.0"
+description = "Monitor chrony time synchronization with GPS PPS and NTP support"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "RMS Team"}
+]
+keywords = ["chrony", "ntp", "gps", "pps", "time", "synchronization", "monitor"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Networking :: Time Synchronization",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[project.scripts]
+chrony-monitor = "chrony_monitor.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/chrony-monitor"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["chrony_monitor*"]

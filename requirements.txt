@@ -1,0 +1,15 @@
+# Chrony Monitor Requirements
+#
+# This package has no external Python dependencies - it uses only stdlib.
+# The curses module is part of the Python standard library on Linux.
+#
+# System requirements:
+# - chronyc (from chrony package)
+# - For GPS PPS mode:
+#   - ldattach (from util-linux)
+#   - ppstest (from pps-tools)
+#   - gpsd (optional, for NMEA time source)
+#
+# Development dependencies (optional):
+# pytest
+# pytest-cov

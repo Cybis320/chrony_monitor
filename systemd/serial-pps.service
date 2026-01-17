@@ -1,0 +1,15 @@
+[Unit]
+Description=Initialize PPS on Serial Port DCD
+Before=gpsd.service chrony.service
+After=network.target
+
+[Service]
+Type=forking
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/init-serial-pps.sh
+ExecStop=/bin/bash -c 'if [ -f /var/run/ldattach.pid ]; then kill $(cat /var/run/ldattach.pid) 2>/dev/null || true; fi'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
