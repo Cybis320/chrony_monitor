@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Chrony Monitor
+Type=Application
+Exec=gnome-terminal --title="Chrony Monitor" --geometry=80x24 -- python3 -m chrony_monitor
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+Icon=utilities-system-monitor
+Comment=Monitor chrony time synchronization
+Categories=System;Monitor;

@@ -37,7 +37,7 @@ This installs:
 - Python package
 - Systemd services for PPS initialization
 - Udev rules for GPS/PPS devices
-- Desktop launcher
+- Desktop launcher and autostart (launches on login)
 
 ## Usage
 

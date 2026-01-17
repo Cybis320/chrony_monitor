@@ -120,26 +120,22 @@ EOF
     info "GPS PPS support configured."
 }
 
-# Install desktop file (user mode)
+# Install desktop file and autostart
 install_desktop_file() {
-    info "Installing desktop launcher..."
+    info "Installing desktop launcher and autostart..."
 
+    # Desktop launcher (for manual launch)
     DESKTOP_DIR="${HOME}/.local/share/applications"
     mkdir -p "$DESKTOP_DIR"
+    cp "$PROJECT_DIR/autostart/chrony-monitor.desktop" "$DESKTOP_DIR/"
 
-    cat > "$DESKTOP_DIR/chrony-monitor.desktop" << EOF
-[Desktop Entry]
-Name=Chrony Monitor
-Type=Application
-Exec=gnome-terminal --title="Chrony Monitor" -- python3 -m chrony_monitor
-Hidden=false
-NoDisplay=false
-Icon=utilities-system-monitor
-Comment=Monitor chrony time synchronization
-Categories=System;Monitor;
-EOF
+    # Autostart (launches on login)
+    AUTOSTART_DIR="${HOME}/.config/autostart"
+    mkdir -p "$AUTOSTART_DIR"
+    cp "$PROJECT_DIR/autostart/chrony-monitor.desktop" "$AUTOSTART_DIR/"
 
     info "Desktop launcher installed at $DESKTOP_DIR/chrony-monitor.desktop"
+    info "Autostart enabled at $AUTOSTART_DIR/chrony-monitor.desktop"
 }
 
 # Print usage information
@@ -147,18 +143,15 @@ print_usage() {
     echo ""
     echo "Chrony Monitor has been installed!"
     echo ""
-    echo "Usage:"
+    echo "The monitor will start automatically on login."
+    echo ""
+    echo "Manual usage:"
     echo "  python3 -m chrony_monitor          # Run the monitor"
     echo "  python3 -m chrony_monitor --help   # Show all options"
     echo "  python3 -m chrony_monitor --status # Print status and exit"
     echo ""
-    echo "Options:"
-    echo "  --ntp-only      Force NTP-only mode"
-    echo "  --no-recovery   Disable auto-recovery"
-    echo "  --interval N    Set polling interval (default: 1s)"
-    echo ""
     if [ "$USER_INSTALL" -eq 0 ]; then
-        echo "GPS PPS services have been installed. To start:"
+        echo "GPS PPS services have been installed. To start now:"
         echo "  systemctl start serial-pps"
         echo "  systemctl start chrony"
         echo ""
