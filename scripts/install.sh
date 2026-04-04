@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Chrony Monitor Installation Script
-# Installs the chrony-monitor package and optionally sets up GPS PPS support
+# Installs the chrony-monitor package and sets up GPS PPS support
 #
 
 set -e
@@ -25,6 +25,15 @@ warn() {
 
 error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+backup_config() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        local backup="${file}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$file" "$backup"
+        info "Backed up $file -> $backup"
+    fi
 }
 
 # Check if running as root for system-wide install
@@ -82,6 +91,81 @@ EOF
     info "Systemd services installed."
 }
 
+# Configure GPSD for USB GPS
+configure_gpsd() {
+    if [ "$USER_INSTALL" -eq 1 ]; then
+        warn "Skipping GPSD configuration (requires root)"
+        return
+    fi
+
+    info "Configuring GPSD for USB GPS..."
+
+    backup_config /etc/default/gpsd
+
+    cat > /etc/default/gpsd << 'EOF'
+# GPS device connected via USB
+DEVICES="/dev/ttyACM0"
+
+# Enable immediate GPS startup
+START_DAEMON="true"
+GPSD_OPTIONS="-n -b"
+
+# GPSD socket for chrony SHM
+GPSD_SOCKET="/var/run/gpsd.sock"
+EOF
+
+    info "GPSD configured."
+}
+
+# Write chrony.conf with GPS+PPS refclocks
+configure_chrony() {
+    if [ "$USER_INSTALL" -eq 1 ]; then
+        warn "Skipping chrony.conf configuration (requires root)"
+        return
+    fi
+
+    info "Writing chrony configuration for GPS+PPS..."
+
+    backup_config /etc/chrony/chrony.conf
+
+    cat > /etc/chrony/chrony.conf << 'EOF'
+# Include configuration files from conf.d
+confdir /etc/chrony/conf.d
+
+# GPS NMEA data from gpsd (USB GPS)
+# This provides the coarse time and second labels
+refclock SHM 0 delay 0.2 offset 0.0 poll 4 refid GPS
+
+# PPS signal from serial port DCD pin
+# The :clear option uses the DCD deassert edge, which corresponds to the
+# true second boundary when PPS passes through a MAX232 RS-232 driver
+# (the TX driver inverts the signal, so DCD assert = falling edge of pulse)
+refclock PPS /dev/pps0:clear poll 4 refid GPPS lock GPS prefer
+
+# Network time servers as fallback
+pool ntp.ubuntu.com iburst maxsources 4
+pool us.pool.ntp.org iburst maxsources 2
+
+# Standard chrony settings
+sourcedir /run/chrony-dhcp
+sourcedir /etc/chrony/sources.d
+keyfile /etc/chrony/chrony.keys
+driftfile /var/lib/chrony/chrony.drift
+ntsdumpdir /var/lib/chrony
+logdir /var/log/chrony
+rtcsync
+makestep 1 3
+leapsectz right/UTC
+
+# Optimize for GPS/PPS
+maxupdateskew 100.0
+maxclockerror 0.001
+maxsamples 32
+EOF
+
+    info "Chrony configuration written."
+}
+
 # Set up GPS PPS (requires root)
 setup_gps_pps() {
     if [ "$USER_INSTALL" -eq 1 ]; then
@@ -97,11 +181,12 @@ setup_gps_pps() {
     fi
 
     # Add to modules to load at boot
-    if [ -f /etc/modules-load.d ]; then
+    if [ -d /etc/modules-load.d ]; then
         echo "pps_ldisc" > /etc/modules-load.d/pps.conf
     fi
 
     # Configure chrony service dependencies
+    # NOTE: intentionally does not list gpsd.service to avoid circular dependency
     mkdir -p /etc/systemd/system/chrony.service.d/
     cat > /etc/systemd/system/chrony.service.d/gps-pps.conf << 'EOF'
 [Unit]
@@ -110,6 +195,19 @@ Wants=serial-pps.service
 
 [Service]
 ExecStartPre=/bin/sleep 2
+EOF
+
+    # Configure gpsd service dependencies
+    # Clear default After=chronyd.service to break circular dependency
+    mkdir -p /etc/systemd/system/gpsd.service.d/
+    cat > /etc/systemd/system/gpsd.service.d/serial-pps.conf << 'EOF'
+[Unit]
+After=
+After=network.target serial-pps.service
+Wants=serial-pps.service
+
+[Service]
+ExecStartPre=/bin/sleep 1
 EOF
 
     # Enable serial-pps service
@@ -138,6 +236,49 @@ install_desktop_file() {
     info "Autostart enabled at $AUTOSTART_DIR/chrony-monitor.desktop"
 }
 
+# Validate hardware setup
+validate_hardware() {
+    if [ "$USER_INSTALL" -eq 1 ]; then
+        return
+    fi
+
+    info "Validating hardware and services..."
+
+    # Check for USB GPS device
+    if [ -e /dev/ttyACM0 ]; then
+        info "GPS USB device found: /dev/ttyACM0"
+    else
+        warn "GPS USB device not found at /dev/ttyACM0"
+        ls -la /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || true
+    fi
+
+    # Check PPS device
+    if [ -e /dev/pps0 ]; then
+        info "/dev/pps0 exists"
+        timeout 2 ppstest /dev/pps0 2>&1 | head -3 || warn "ppstest not available or no pulses"
+    else
+        warn "/dev/pps0 not found - PPS may not be connected"
+    fi
+
+    # Check gpsd
+    if systemctl is-active --quiet gpsd; then
+        info "GPSD is running"
+        timeout 2 gpspipe -w -n 5 2>/dev/null | grep -q "TPV" && info "GPS has fix" || warn "Waiting for GPS fix..."
+    else
+        warn "GPSD is not running"
+    fi
+
+    # Check chrony
+    if systemctl is-active --quiet chrony; then
+        info "Chrony is running"
+        echo ""
+        echo "Chrony sources:"
+        chronyc sources | grep -E "(GPS|GPPS)" || warn "No GPS/GPPS sources visible yet"
+    else
+        warn "Chrony is not running"
+    fi
+}
+
 # Print usage information
 print_usage() {
     echo ""
@@ -153,7 +294,11 @@ print_usage() {
     if [ "$USER_INSTALL" -eq 0 ]; then
         echo "GPS PPS services have been installed. To start now:"
         echo "  systemctl start serial-pps"
+        echo "  systemctl start gpsd"
         echo "  systemctl start chrony"
+        echo ""
+        echo "If services fail to start due to dependency issues, run:"
+        echo "  sudo $SCRIPT_DIR/fix-dependencies.sh"
         echo ""
     fi
 }
@@ -168,8 +313,11 @@ main() {
     check_root
     install_python_package
     install_systemd_services
+    configure_gpsd
+    configure_chrony
     setup_gps_pps
     install_desktop_file
+    validate_hardware
     print_usage
 
     echo "========================================"
