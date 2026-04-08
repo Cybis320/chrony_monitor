@@ -104,15 +104,28 @@ class RecoveryManager:
         except Exception:
             return False
 
+    def _get_pps_device(self) -> str:
+        """Get the PPS device path."""
+        if os.path.exists('/dev/serial-pps'):
+            return '/dev/serial-pps'
+        return '/dev/pps0'
+
     def _test_pps(self) -> bool:
-        """Test if PPS device is working."""
+        """Test if PPS device is working by checking sysfs pulse counter."""
+        pps_dev = self._get_pps_device()
+        # Resolve symlink to get the ppsN name
+        real_path = os.path.realpath(pps_dev)
+        pps_name = os.path.basename(real_path)
+        assert_path = f"/sys/class/pps/{pps_name}/assert"
+
         try:
-            result = subprocess.run(
-                ["timeout", "2", "ppstest", "/dev/pps0"],
-                capture_output=True,
-                text=True
-            )
-            return "source 0" in result.stdout
+            with open(assert_path) as f:
+                count1 = f.read().strip()
+            time.sleep(2)
+            with open(assert_path) as f:
+                count2 = f.read().strip()
+            # If the assert timestamp changed, PPS is receiving pulses
+            return count1 != count2
         except Exception:
             return False
 
@@ -136,9 +149,9 @@ class RecoveryManager:
                 logs.append("serial-pps service is active, restarting services...")
 
                 # Stop services in reverse order
-                subprocess.run(sudo + ["systemctl", "stop", "chrony"], capture_output=True)
-                subprocess.run(sudo + ["systemctl", "stop", "gpsd"], capture_output=True)
-                subprocess.run(sudo + ["systemctl", "stop", "serial-pps"], capture_output=True)
+                subprocess.run(sudo + ["systemctl", "stop", "chrony.service"], capture_output=True)
+                subprocess.run(sudo + ["systemctl", "stop", "gpsd.service"], capture_output=True)
+                subprocess.run(sudo + ["systemctl", "stop", "serial-pps.service"], capture_output=True)
                 time.sleep(1)
 
                 # Kill stale ldattach
@@ -146,11 +159,11 @@ class RecoveryManager:
                 time.sleep(1)
 
                 # Start services in order
-                subprocess.run(sudo + ["systemctl", "start", "serial-pps"], capture_output=True)
+                subprocess.run(sudo + ["systemctl", "start", "serial-pps.service"], capture_output=True)
                 time.sleep(2)
-                subprocess.run(sudo + ["systemctl", "start", "gpsd"], capture_output=True)
+                subprocess.run(sudo + ["systemctl", "start", "gpsd.service"], capture_output=True)
                 time.sleep(2)
-                subprocess.run(sudo + ["systemctl", "start", "chrony"], capture_output=True)
+                subprocess.run(sudo + ["systemctl", "start", "chrony.service"], capture_output=True)
                 time.sleep(3)
 
                 if self._test_pps():
@@ -170,7 +183,7 @@ class RecoveryManager:
             time.sleep(1)
 
             # Try each serial port
-            for port in ["/dev/ttyS0", "/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3"]:
+            for port in ["/dev/ttyS0", "/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3", "/dev/ttyS4"]:
                 if not os.path.exists(port):
                     continue
 
@@ -189,9 +202,9 @@ class RecoveryManager:
                         logs.append(f"PPS recovered on {port}")
 
                         # Restart dependent services
-                        subprocess.run(sudo + ["systemctl", "restart", "gpsd"], capture_output=True)
+                        subprocess.run(sudo + ["systemctl", "restart", "gpsd.service"], capture_output=True)
                         time.sleep(1)
-                        subprocess.run(sudo + ["systemctl", "restart", "chrony"], capture_output=True)
+                        subprocess.run(sudo + ["systemctl", "restart", "chrony.service"], capture_output=True)
                         logs.append("Services restarted")
                         return True, logs
 
@@ -200,10 +213,19 @@ class RecoveryManager:
                     continue
 
         else:
-            logs.append("ldattach is running but PPS not working")
-            # Just restart chrony
-            subprocess.run(sudo + ["systemctl", "restart", "chrony"], capture_output=True)
-            logs.append("Chrony restarted")
+            logs.append("ldattach is running but PPS not working, restarting all services...")
+            subprocess.run(sudo + ["systemctl", "restart", "serial-pps.service"], capture_output=True)
+            time.sleep(2)
+            subprocess.run(sudo + ["systemctl", "restart", "gpsd.service"], capture_output=True)
+            time.sleep(2)
+            subprocess.run(sudo + ["systemctl", "restart", "chrony.service"], capture_output=True)
+            time.sleep(3)
+
+            if self._test_pps():
+                logs.append("PPS recovered via full service restart")
+                return True, logs
+            else:
+                logs.append("PPS still not working after full restart")
 
         return False, logs
 

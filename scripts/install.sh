@@ -36,38 +36,35 @@ backup_config() {
     fi
 }
 
-# Check if running as root for system-wide install
+# Require root
 check_root() {
     if [ "$EUID" -ne 0 ]; then
-        warn "Not running as root. Installing in user mode."
-        USER_INSTALL=1
-    else
-        USER_INSTALL=0
+        error "This script must be run with sudo."
+        exit 1
     fi
 }
 
-# Install Python package
-install_python_package() {
-    info "Installing chrony-monitor Python package..."
+# Install required system packages (requires root)
+install_dependencies() {
+    info "Checking system dependencies..."
 
-    cd "$PROJECT_DIR"
+    PACKAGES_NEEDED=""
+    for pkg in gpsd gpsd-clients pps-tools chrony; do
+        if ! dpkg -s "$pkg" &>/dev/null; then
+            PACKAGES_NEEDED="$PACKAGES_NEEDED $pkg"
+        fi
+    done
 
-    if [ "$USER_INSTALL" -eq 1 ]; then
-        pip3 install --user -e .
+    if [ -n "$PACKAGES_NEEDED" ]; then
+        info "Installing missing packages:$PACKAGES_NEEDED"
+        apt-get install -y $PACKAGES_NEEDED
     else
-        pip3 install -e .
+        info "All dependencies already installed."
     fi
-
-    info "Python package installed."
 }
 
 # Install systemd services (requires root)
 install_systemd_services() {
-    if [ "$USER_INSTALL" -eq 1 ]; then
-        warn "Skipping systemd service installation (requires root)"
-        return
-    fi
-
     info "Installing systemd services..."
 
     # Install serial-pps service for GPS PPS initialization
@@ -77,27 +74,36 @@ install_systemd_services() {
 
     # Create udev rules for PPS device
     cat > /etc/udev/rules.d/99-gps-pps.rules << 'EOF'
-# GPS USB device
-SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", MODE="0666", GROUP="dialout", SYMLINK+="gps0"
+# GPS USB device — set permissions and restart services on hotplug
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", MODE="0666", GROUP="dialout", SYMLINK+="gps0", TAG+="systemd", ENV{SYSTEMD_WANTS}="gps-hotplug.service"
 
 # PPS device permissions
 SUBSYSTEM=="pps", MODE="0666", GROUP="dialout"
-KERNEL=="pps0", SYMLINK+="gpspps0"
 EOF
 
-    # Reload systemd
+    # GPS hotplug service — restarts gpsd and serial-pps when GPS is plugged in
+    cat > /etc/systemd/system/gps-hotplug.service << 'EOF'
+[Unit]
+Description=Restart GPS services on hotplug
+After=serial-pps.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart serial-pps.service
+ExecStart=/bin/systemctl restart gpsd.service
+ExecStartPost=/bin/sleep 2
+ExecStartPost=/bin/systemctl restart chrony.service
+EOF
+
+    # Reload systemd and udev
     systemctl daemon-reload
+    udevadm control --reload-rules
 
     info "Systemd services installed."
 }
 
 # Configure GPSD for USB GPS
 configure_gpsd() {
-    if [ "$USER_INSTALL" -eq 1 ]; then
-        warn "Skipping GPSD configuration (requires root)"
-        return
-    fi
-
     info "Configuring GPSD for USB GPS..."
 
     backup_config /etc/default/gpsd
@@ -119,11 +125,6 @@ EOF
 
 # Write chrony.conf with GPS+PPS refclocks
 configure_chrony() {
-    if [ "$USER_INSTALL" -eq 1 ]; then
-        warn "Skipping chrony.conf configuration (requires root)"
-        return
-    fi
-
     info "Writing chrony configuration for GPS+PPS..."
 
     backup_config /etc/chrony/chrony.conf
@@ -140,7 +141,7 @@ refclock SHM 0 delay 0.2 offset 0.0 poll 4 refid GPS
 # The :clear option uses the DCD deassert edge, which corresponds to the
 # true second boundary when PPS passes through a MAX232 RS-232 driver
 # (the TX driver inverts the signal, so DCD assert = falling edge of pulse)
-refclock PPS /dev/pps0:clear poll 4 refid GPPS lock GPS prefer
+refclock PPS /dev/serial-pps:clear poll 4 refid GPPS lock GPS prefer
 
 # Network time servers as fallback
 pool ntp.ubuntu.com iburst maxsources 4
@@ -168,11 +169,6 @@ EOF
 
 # Set up GPS PPS (requires root)
 setup_gps_pps() {
-    if [ "$USER_INSTALL" -eq 1 ]; then
-        warn "Skipping GPS PPS setup (requires root)"
-        return
-    fi
-
     info "Setting up GPS PPS support..."
 
     # Load pps_ldisc module
@@ -222,26 +218,85 @@ EOF
 install_desktop_file() {
     info "Installing desktop launcher and autostart..."
 
+    # Use the invoking user's home when run via sudo
+    if [ -n "$SUDO_USER" ]; then
+        TARGET_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    else
+        TARGET_HOME="$HOME"
+    fi
+
+    # Generate desktop file with correct project path
+    DESKTOP_FILE="$(mktemp)"
+    sed "s|^Exec=.*|&\nPath=$PROJECT_DIR|" "$PROJECT_DIR/autostart/chrony-monitor.desktop" > "$DESKTOP_FILE"
+
     # Desktop launcher (for manual launch)
-    DESKTOP_DIR="${HOME}/.local/share/applications"
+    DESKTOP_DIR="${TARGET_HOME}/.local/share/applications"
     mkdir -p "$DESKTOP_DIR"
-    cp "$PROJECT_DIR/autostart/chrony-monitor.desktop" "$DESKTOP_DIR/"
+    cp "$DESKTOP_FILE" "$DESKTOP_DIR/chrony-monitor.desktop"
 
     # Autostart (launches on login)
-    AUTOSTART_DIR="${HOME}/.config/autostart"
+    AUTOSTART_DIR="${TARGET_HOME}/.config/autostart"
     mkdir -p "$AUTOSTART_DIR"
-    cp "$PROJECT_DIR/autostart/chrony-monitor.desktop" "$AUTOSTART_DIR/"
+    cp "$DESKTOP_FILE" "$AUTOSTART_DIR/chrony-monitor.desktop"
+
+    # Desktop shortcut
+    DESKTOP_SHORTCUT="${TARGET_HOME}/Desktop/chrony-monitor.desktop"
+    if [ -d "${TARGET_HOME}/Desktop" ]; then
+        cp "$DESKTOP_FILE" "$DESKTOP_SHORTCUT"
+        chmod +x "$DESKTOP_SHORTCUT"
+        info "Desktop shortcut installed at $DESKTOP_SHORTCUT"
+    fi
+
+    # Ensure the invoking user owns the directories and files
+    if [ -n "$SUDO_USER" ]; then
+        chown "$SUDO_USER:$SUDO_USER" "$DESKTOP_DIR" "$AUTOSTART_DIR"
+        chown "$SUDO_USER:$SUDO_USER" "$DESKTOP_DIR/chrony-monitor.desktop" "$AUTOSTART_DIR/chrony-monitor.desktop"
+        [ -f "$DESKTOP_SHORTCUT" ] && chown "$SUDO_USER:$SUDO_USER" "$DESKTOP_SHORTCUT"
+
+        # Add user to dialout group for serial/GPS device access
+        if ! id -nG "$SUDO_USER" | grep -qw dialout; then
+            usermod -aG dialout "$SUDO_USER"
+            info "Added $SUDO_USER to dialout group (re-login required)"
+        fi
+
+        # Allow passwordless sudo for GPS/PPS service recovery
+        cat > /etc/sudoers.d/chrony-monitor << SUDOEOF
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart serial-pps.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart gpsd.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart chrony.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl stop serial-pps.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl stop gpsd.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl stop chrony.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start serial-pps.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start gpsd.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start chrony.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl is-active serial-pps
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/pkill ldattach
+SUDOEOF
+        chmod 440 /etc/sudoers.d/chrony-monitor
+        info "Sudoers rules installed for passwordless service recovery"
+    fi
+
+    rm -f "$DESKTOP_FILE"
 
     info "Desktop launcher installed at $DESKTOP_DIR/chrony-monitor.desktop"
     info "Autostart enabled at $AUTOSTART_DIR/chrony-monitor.desktop"
 }
 
+# Start or restart services
+start_services() {
+    info "Starting services..."
+
+    systemctl enable --now serial-pps.service || warn "Could not start serial-pps"
+    systemctl enable --now gpsd.service || warn "Could not start gpsd"
+    systemctl restart chrony.service || warn "Could not restart chrony"
+
+    # Give services a moment to settle
+    sleep 2
+}
+
 # Validate hardware setup
 validate_hardware() {
-    if [ "$USER_INSTALL" -eq 1 ]; then
-        return
-    fi
-
     info "Validating hardware and services..."
 
     # Check for USB GPS device
@@ -253,11 +308,11 @@ validate_hardware() {
     fi
 
     # Check PPS device
-    if [ -e /dev/pps0 ]; then
-        info "/dev/pps0 exists"
-        timeout 2 ppstest /dev/pps0 2>&1 | head -3 || warn "ppstest not available or no pulses"
+    if [ -L /dev/serial-pps ]; then
+        PPS_TARGET="$(readlink -f /dev/serial-pps)"
+        info "PPS symlink /dev/serial-pps -> $PPS_TARGET"
     else
-        warn "/dev/pps0 not found - PPS may not be connected"
+        warn "/dev/serial-pps not found - PPS may not be connected"
     fi
 
     # Check gpsd
@@ -291,16 +346,9 @@ print_usage() {
     echo "  python3 -m chrony_monitor --help   # Show all options"
     echo "  python3 -m chrony_monitor --status # Print status and exit"
     echo ""
-    if [ "$USER_INSTALL" -eq 0 ]; then
-        echo "GPS PPS services have been installed. To start now:"
-        echo "  systemctl start serial-pps"
-        echo "  systemctl start gpsd"
-        echo "  systemctl start chrony"
-        echo ""
-        echo "If services fail to start due to dependency issues, run:"
-        echo "  sudo $SCRIPT_DIR/fix-dependencies.sh"
-        echo ""
-    fi
+    echo "If services fail to start due to dependency issues, run:"
+    echo "  sudo $SCRIPT_DIR/fix-dependencies.sh"
+    echo ""
 }
 
 # Main installation
@@ -311,12 +359,13 @@ main() {
     echo ""
 
     check_root
-    install_python_package
+    install_dependencies
     install_systemd_services
     configure_gpsd
     configure_chrony
     setup_gps_pps
     install_desktop_file
+    start_services
     validate_hardware
     print_usage
 

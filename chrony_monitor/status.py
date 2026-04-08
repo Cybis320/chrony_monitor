@@ -127,7 +127,7 @@ def has_usb_gps() -> bool:
 
 def has_pps_device() -> bool:
     """Check if PPS device exists."""
-    return os.path.exists('/dev/pps0')
+    return os.path.exists('/dev/serial-pps') or os.path.exists('/dev/pps0')
 
 
 def get_chrony_sources() -> tuple:
