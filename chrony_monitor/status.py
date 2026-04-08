@@ -126,8 +126,19 @@ def has_usb_gps() -> bool:
 
 
 def has_pps_device() -> bool:
-    """Check if PPS device exists."""
-    return os.path.exists('/dev/serial-pps') or os.path.exists('/dev/pps0')
+    """Check if a GPS PPS device exists (GPIO or serial)."""
+    if os.path.exists('/dev/gps-pps') or os.path.exists('/dev/serial-pps'):
+        return True
+    # Check sysfs for GPIO PPS (RPi) or serial PPS
+    for name_path in glob.glob('/sys/class/pps/pps*/name'):
+        try:
+            with open(name_path) as f:
+                name = f.read().strip()
+            if name.startswith(('pps@', 'pps-gpio', 'serial')):
+                return True
+        except (OSError, PermissionError):
+            continue
+    return False
 
 
 def get_chrony_sources() -> tuple:

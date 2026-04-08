@@ -8,6 +8,15 @@ from datetime import datetime
 from typing import List, Tuple
 
 
+def is_raspberry_pi() -> bool:
+    """Detect if running on a Raspberry Pi."""
+    try:
+        with open('/proc/device-tree/model', 'r') as f:
+            return 'raspberry pi' in f.read().lower()
+    except (FileNotFoundError, PermissionError):
+        return False
+
+
 @dataclass
 class RecoveryConfig:
     """Configuration for recovery behavior."""
@@ -106,8 +115,21 @@ class RecoveryManager:
 
     def _get_pps_device(self) -> str:
         """Get the PPS device path."""
+        if os.path.exists('/dev/gps-pps'):
+            return '/dev/gps-pps'
         if os.path.exists('/dev/serial-pps'):
             return '/dev/serial-pps'
+        # Find GPIO PPS device by checking sysfs
+        import glob as globmod
+        for name_path in sorted(globmod.glob('/sys/class/pps/pps*/name')):
+            try:
+                with open(name_path) as f:
+                    name = f.read().strip()
+                # Match GPIO PPS: "pps@<pin>.*" on RPi 5, "pps-gpio" on older kernels
+                if name.startswith('pps@') or name.startswith('pps-gpio'):
+                    return '/dev/' + os.path.basename(os.path.dirname(name_path))
+            except (OSError, PermissionError):
+                continue
         return '/dev/pps0'
 
     def _test_pps(self) -> bool:
@@ -131,6 +153,44 @@ class RecoveryManager:
 
     def _do_recovery(self) -> Tuple[bool, List[str]]:
         """Perform the actual recovery steps."""
+        if is_raspberry_pi():
+            return self._do_gpio_recovery()
+        return self._do_serial_recovery()
+
+    def _do_gpio_recovery(self) -> Tuple[bool, List[str]]:
+        """Recovery for GPIO PPS (Raspberry Pi)."""
+        logs = []
+        sudo = self._get_sudo_prefix()
+
+        if sudo:
+            logs.append("Not running as root, using sudo...")
+
+        # GPIO PPS is kernel-managed — recovery is just restarting services
+        logs.append("Restarting gpsd and chrony...")
+
+        try:
+            subprocess.run(sudo + ["systemctl", "stop", "chrony.service"], capture_output=True)
+            subprocess.run(sudo + ["systemctl", "stop", "gpsd.service"], capture_output=True)
+            time.sleep(1)
+
+            subprocess.run(sudo + ["systemctl", "start", "gpsd.service"], capture_output=True)
+            time.sleep(2)
+            subprocess.run(sudo + ["systemctl", "start", "chrony.service"], capture_output=True)
+            time.sleep(3)
+
+            if self._test_pps():
+                logs.append("PPS recovered via service restart")
+                return True, logs
+            else:
+                logs.append("PPS still not working after service restart")
+                logs.append("Check GPIO wiring and pps-gpio overlay in config.txt")
+        except Exception as e:
+            logs.append(f"Service restart failed: {e}")
+
+        return False, logs
+
+    def _do_serial_recovery(self) -> Tuple[bool, List[str]]:
+        """Recovery for serial PPS (Ubuntu/x86)."""
         logs = []
         sudo = self._get_sudo_prefix()
 
