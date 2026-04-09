@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .status import get_status, SyncState
+from .status import get_status, get_gps_info, SyncState
 from .display import Display
 from .recovery import RecoveryManager, RecoveryConfig
 
@@ -33,6 +33,16 @@ class Monitor:
             )
         )
         self.running = False
+        self._gps_cache = None
+        self._gps_last_fetch = 0
+
+    def _get_gps_cached(self):
+        """Get GPS info, refreshing every 10 seconds."""
+        now = time.time()
+        if now - self._gps_last_fetch >= 10:
+            self._gps_cache = get_gps_info()
+            self._gps_last_fetch = now
+        return self._gps_cache
 
     def run(self, scr):
         """Main monitor loop (called by curses.wrapper)."""
@@ -45,6 +55,7 @@ class Monitor:
                 force_ntp_only=self.config.ntp_only,
                 recovering=self.recovery_manager.is_recovering
             )
+            status.gps = self._get_gps_cached()
 
             # Handle recovery logic for PPS mode
             if status.pps_expected and self.config.recovery_enabled:
@@ -65,7 +76,9 @@ class Monitor:
 
     def _handle_recovery(self, status):
         """Handle recovery state machine."""
-        is_healthy = status.sync_state == SyncState.GPPS_LOCKED
+        from .status import SyncQuality
+        is_healthy = (status.sync_state == SyncState.GPPS_LOCKED
+                      and status.sync_quality != SyncQuality.DEGRADED)
 
         if is_healthy:
             self.recovery_manager.reset()

@@ -99,24 +99,53 @@ def format_offset(offset_ms: Optional[float]) -> str:
     return f"{offset_ms / 1000:.2f}s"
 
 
+def format_confidence_line(status: ChronyStatus) -> str:
+    """Format time confidence line."""
+    parts = []
+    if status.tracking:
+        t = status.tracking
+        parts.append(f"Bound ±{format_us(t.root_dispersion_us)}")
+        parts.append(f"RMS {format_us(t.rms_offset_us)}")
+        parts.append(f"Skew {t.skew_ppm:.2f}ppm")
+        parts.append(f"Poll {t.update_interval:.0f}s")
+        parts.append(f"Stratum {t.stratum}")
+    if parts:
+        return " | ".join(parts)
+    if status.error_message:
+        return status.error_message
+    return "No tracking data"
+
+
+def format_us(us: float) -> str:
+    """Format microseconds for display."""
+    if us < 1.0:
+        return f"{us * 1000:.0f}ns"
+    if us < 1000.0:
+        return f"{us:.1f}us"
+    if us < 1000000.0:
+        return f"{us / 1000:.1f}ms"
+    return f"{us / 1000000:.2f}s"
+
+
+def format_gps_line(status: ChronyStatus) -> str:
+    """Format GPS satellite info line."""
+    if not status.gps:
+        return ""
+    g = status.gps
+    parts = [f"Sats {g.satellites_used}/{g.satellites_visible}"]
+    if g.tdop > 0:
+        parts.append(f"TDOP {g.tdop:.2f}")
+    return " | ".join(parts)
+
+
 def format_source_info(status: ChronyStatus) -> str:
     """Format source information line."""
     if status.selected_source:
         src = status.selected_source
-        offset_str = format_offset(status.offset_ms)
-        return f"{src.name} | Reach {src.reach} | LastRx {src.last_rx} | Offset {offset_str}"
+        return f"Source: {src.name} | Reach {src.reach} | LastRx {src.last_rx}"
     if status.error_message:
         return status.error_message
     return "No source selected"
-
-
-def format_mode_info(status: ChronyStatus) -> str:
-    """Format mode/expectation information."""
-    if status.pps_expected:
-        if status.usb_gps_detected:
-            return "Mode: GPS PPS expected (USB GPS detected)"
-        return "Mode: GPS PPS expected"
-    return "Mode: NTP only"
 
 
 class Display:
@@ -143,15 +172,20 @@ class Display:
 
         # Main banner
         banner = get_banner_text(status)
-        self._addstr_centered(mid - 1, banner, curses.A_BOLD)
+        self._addstr_centered(mid - 2, banner, curses.A_BOLD)
+
+        # Confidence line
+        confidence = format_confidence_line(status)
+        self._addstr_centered(mid, confidence)
 
         # Source info line
         info = format_source_info(status)
-        self._addstr_centered(mid + 1, info)
+        self._addstr_centered(mid + 1, info, curses.A_DIM)
 
-        # Mode info
-        mode_info = format_mode_info(status)
-        self._addstr_centered(mid + 2, mode_info, curses.A_DIM)
+        # GPS satellite info
+        gps_line = format_gps_line(status)
+        if gps_line:
+            self._addstr_centered(mid + 2, gps_line, curses.A_DIM)
 
         # Lock lost timer (if applicable)
         if lock_lost_seconds is not None and lock_lost_seconds > 0:

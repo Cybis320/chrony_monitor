@@ -1,10 +1,11 @@
 """Status checking and mode detection for chrony sync monitoring."""
 
 import glob
+import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
@@ -45,6 +46,27 @@ class SourceInfo:
 
 
 @dataclass
+class TrackingInfo:
+    """Chrony tracking data for time confidence."""
+    stratum: int = 0
+    root_dispersion_us: float = 0.0   # Error bound in microseconds
+    rms_offset_us: float = 0.0        # Typical offset in microseconds
+    frequency_ppm: float = 0.0
+    skew_ppm: float = 0.0
+    update_interval: float = 0.0      # seconds
+
+
+@dataclass
+class GpsInfo:
+    """GPS satellite and geometry info."""
+    satellites_used: int = 0
+    satellites_visible: int = 0
+    tdop: float = 0.0    # Time DOP
+    hdop: float = 0.0
+    pdop: float = 0.0
+
+
+@dataclass
 class ChronyStatus:
     """Complete status of chrony synchronization."""
     sources: list
@@ -55,6 +77,8 @@ class ChronyStatus:
     error_message: Optional[str]
     usb_gps_detected: bool
     pps_expected: bool
+    tracking: Optional[TrackingInfo] = None
+    gps: Optional[GpsInfo] = None
 
 
 # Regex to match the selected source line (starts with * after mode char)
@@ -139,6 +163,93 @@ def has_pps_device() -> bool:
         except (OSError, PermissionError):
             continue
     return False
+
+
+def get_tracking_info() -> Optional[TrackingInfo]:
+    """Get chrony tracking data."""
+    try:
+        out = subprocess.check_output(
+            ["chronyc", "tracking"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5
+        )
+    except Exception:
+        return None
+
+    info = TrackingInfo()
+    for line in out.splitlines():
+        if ':' not in line:
+            continue
+        key, val = line.split(':', 1)
+        key = key.strip()
+        val = val.strip()
+
+        if key == 'Stratum':
+            try:
+                info.stratum = int(val)
+            except ValueError:
+                pass
+        elif key == 'Root dispersion':
+            info.root_dispersion_us = _parse_seconds_to_us(val)
+        elif key == 'RMS offset':
+            info.rms_offset_us = _parse_seconds_to_us(val)
+        elif key == 'Frequency':
+            match = re.match(r'([+-]?\d+\.?\d*)', val)
+            if match:
+                info.frequency_ppm = float(match.group(1))
+        elif key == 'Skew':
+            match = re.match(r'([+-]?\d+\.?\d*)', val)
+            if match:
+                info.skew_ppm = float(match.group(1))
+        elif key == 'Update interval':
+            match = re.match(r'([+-]?\d+\.?\d*)', val)
+            if match:
+                info.update_interval = float(match.group(1))
+
+    return info
+
+
+def _parse_seconds_to_us(val: str) -> float:
+    """Parse chrony seconds field to microseconds."""
+    match = re.match(r'([+-]?\d+\.?\d*)\s*seconds', val)
+    if match:
+        return abs(float(match.group(1))) * 1_000_000
+    return 0.0
+
+
+def get_gps_info() -> Optional[GpsInfo]:
+    """Get GPS satellite info from gpsd."""
+    try:
+        out = subprocess.check_output(
+            ["gpspipe", "-w", "-n", "8"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=4
+        )
+    except Exception:
+        return None
+
+    info = GpsInfo()
+    for line in out.splitlines():
+        try:
+            msg = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        if msg.get('class') == 'SKY':
+            if 'uSat' in msg:
+                info.satellites_used = msg['uSat']
+            if 'nSat' in msg:
+                info.satellites_visible = msg['nSat']
+            if 'tdop' in msg:
+                info.tdop = msg['tdop']
+            if 'hdop' in msg:
+                info.hdop = msg['hdop']
+            if 'pdop' in msg:
+                info.pdop = msg['pdop']
+
+    return info if info.satellites_used > 0 else None
 
 
 def get_chrony_sources() -> tuple:
@@ -249,6 +360,7 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
     pps_expected = usb_gps and not force_ntp_only
 
     success, sources, error = get_chrony_sources()
+    tracking = get_tracking_info()
 
     if not success:
         return ChronyStatus(
@@ -259,7 +371,8 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
             offset_ms=None,
             error_message=error,
             usb_gps_detected=usb_gps,
-            pps_expected=pps_expected
+            pps_expected=pps_expected,
+            tracking=tracking
         )
 
     # Find selected source
@@ -276,7 +389,8 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
                 offset_ms=None,
                 error_message="No active time source",
                 usb_gps_detected=usb_gps,
-                pps_expected=pps_expected
+                pps_expected=pps_expected,
+                tracking=tracking
             )
         return ChronyStatus(
             sources=sources,
@@ -286,16 +400,22 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
             offset_ms=None,
             error_message="No active time source",
             usb_gps_detected=usb_gps,
-            pps_expected=pps_expected
+            pps_expected=pps_expected,
+            tracking=tracking
         )
 
     offset_ms = selected.offset
     quality = determine_sync_quality(offset_ms)
 
     # Determine state based on source type and expectations
+    source_stale = selected.reach == '0' or parse_lastrx(selected.last_rx) > 120
+
     if selected.is_pps:
-        # PPS source selected - this is GPS PPS mode working correctly
-        state = SyncState.GPPS_LOCKED
+        # PPS source selected but check if it's still reachable
+        if source_stale:
+            state = SyncState.PPS_ISSUE if not recovering else SyncState.RECOVERING
+        else:
+            state = SyncState.GPPS_LOCKED
     elif pps_expected:
         # We expect PPS but it's not the selected source
         if recovering:
@@ -314,5 +434,6 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
         offset_ms=offset_ms,
         error_message=None,
         usb_gps_detected=usb_gps,
-        pps_expected=pps_expected
+        pps_expected=pps_expected,
+        tracking=tracking
     )
