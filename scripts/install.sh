@@ -432,9 +432,11 @@ start_services() {
     info "Starting services..."
 
     if ! is_raspberry_pi; then
-        systemctl enable --now serial-pps.service || warn "Could not start serial-pps"
+        systemctl enable serial-pps.service 2>/dev/null || true
+        systemctl restart serial-pps.service || warn "Could not start serial-pps"
     fi
-    systemctl enable --now gpsd.service || warn "Could not start gpsd"
+    systemctl enable gpsd.service 2>/dev/null || true
+    systemctl restart gpsd.service || warn "Could not start gpsd"
     systemctl restart chrony.service || warn "Could not restart chrony"
 
     # Give services a moment to settle
