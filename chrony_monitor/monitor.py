@@ -2,6 +2,7 @@
 
 import curses
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -35,6 +36,10 @@ class Monitor:
         self.running = False
         self._gps_cache = None
         self._gps_last_fetch = 0
+        self.rms_recent = deque(maxlen=600)    # last 10 min at 1s resolution
+        self.rms_minutes = deque(maxlen=1430)  # ~24h at 1-min resolution
+        self._rms_minute_bucket = []
+        self._rms_minute_count = 0
 
     def _get_gps_cached(self):
         """Get GPS info, refreshing every 10 seconds."""
@@ -57,6 +62,18 @@ class Monitor:
             )
             status.gps = self._get_gps_cached()
 
+            # Record RMS history (1s recent + 1-min long-term)
+            if status.tracking and status.tracking.rms_offset_us > 0:
+                rms = status.tracking.rms_offset_us
+                self.rms_recent.append(rms)
+                self._rms_minute_bucket.append(rms)
+                self._rms_minute_count += 1
+                if self._rms_minute_count >= 60:
+                    avg = sum(self._rms_minute_bucket) / len(self._rms_minute_bucket)
+                    self.rms_minutes.append(avg)
+                    self._rms_minute_bucket.clear()
+                    self._rms_minute_count = 0
+
             # Handle recovery logic for PPS mode
             if status.pps_expected and self.config.recovery_enabled:
                 self._handle_recovery(status)
@@ -66,10 +83,17 @@ class Monitor:
             if status.sync_state in (SyncState.PPS_ISSUE, SyncState.RECOVERING, SyncState.NO_SYNC):
                 lock_lost_seconds = self.recovery_manager.get_lock_lost_seconds()
 
+            # Combine long-term (1-min avg) + recent (1s) for the graph
+            rms_combined = list(self.rms_minutes) + list(self.rms_recent)
+            # Total elapsed seconds: 60s per minute sample + 1s per recent sample
+            rms_duration = len(self.rms_minutes) * 60 + len(self.rms_recent)
+
             display.render(
                 status=status,
                 lock_lost_seconds=lock_lost_seconds,
-                recovery_logs=self.recovery_manager.get_recent_logs()
+                recovery_logs=self.recovery_manager.get_recent_logs(),
+                rms_history=rms_combined,
+                rms_duration=rms_duration
             )
 
             time.sleep(self.config.interval)

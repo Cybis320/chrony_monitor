@@ -222,10 +222,10 @@ def get_gps_info() -> Optional[GpsInfo]:
     """Get GPS satellite info from gpsd."""
     try:
         out = subprocess.check_output(
-            ["gpspipe", "-w", "-n", "8"],
+            ["gpspipe", "-w", "-n", "15"],
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=4
+            timeout=5
         )
     except Exception:
         return None
