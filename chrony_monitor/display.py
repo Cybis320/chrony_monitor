@@ -104,7 +104,10 @@ def format_confidence_line(status: ChronyStatus) -> str:
     parts = []
     if status.tracking:
         t = status.tracking
-        parts.append(f"Bound ±{format_us(t.root_dispersion_us)}")
+        if status.selected_source:
+            parts.append(f"Bound ±{format_us(status.selected_source.error * 1000)}")
+        else:
+            parts.append(f"Bound ±{format_us(t.root_dispersion_us)}")
         parts.append(f"RMS {format_us(t.rms_offset_us)}")
         parts.append(f"Skew {t.skew_ppm:.2f}ppm")
         parts.append(f"Poll {t.update_interval:.0f}s")

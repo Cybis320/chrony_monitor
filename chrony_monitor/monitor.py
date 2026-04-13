@@ -40,6 +40,8 @@ class Monitor:
         self.rms_minutes = deque(maxlen=1430)  # ~24h at 1-min resolution
         self._rms_minute_bucket = []
         self._rms_minute_count = 0
+        self._last_good_status = None
+        self._error_count = 0
 
     def _get_gps_cached(self):
         """Get GPS info, refreshing every 10 seconds."""
@@ -55,11 +57,18 @@ class Monitor:
         display = Display(scr)
 
         while self.running:
-            # Get current status
+            # Get current status — tolerate transient chronyc timeouts
             status = get_status(
                 force_ntp_only=self.config.ntp_only,
                 recovering=self.recovery_manager.is_recovering
             )
+            if status.sync_state == SyncState.DAEMON_ERROR:
+                self._error_count += 1
+                if self._last_good_status and self._error_count < 3:
+                    status = self._last_good_status
+            else:
+                self._error_count = 0
+                self._last_good_status = status
             status.gps = self._get_gps_cached()
 
             # Record RMS history (1s recent + 1-min long-term)
