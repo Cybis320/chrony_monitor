@@ -4,6 +4,7 @@ import curses
 from typing import Optional
 
 from .status import ChronyStatus, SyncState, SyncQuality
+from .tempcomp import TempCompStatus
 
 
 class Color:
@@ -153,6 +154,49 @@ def format_source_info(status: ChronyStatus) -> str:
     return "No source selected"
 
 
+def format_tempcomp_line(tc: TempCompStatus) -> str:
+    """Format temperature compensation status line."""
+    parts = []
+
+    # State: calibrated/extrapolating/off
+    if tc.config and tc.config.is_active:
+        if tc.is_extrapolating:
+            cal_range = ""
+            if tc.temp_range:
+                cal_range = f"{tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C"
+            parts.append(f"TempComp: OUTSIDE CAL ({tc.current_temp_c:.0f}C > {cal_range})")
+        else:
+            if tc.temp_range:
+                parts.append(f"TempComp: cal {tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C")
+            else:
+                parts.append("TempComp: active")
+    else:
+        parts.append("TempComp: off")
+
+    # Current temperature
+    if tc.current_temp_c is not None:
+        parts.append(f"{tc.current_temp_c:.1f}C")
+
+    # Collection status
+    if tc.sample_count > 0:
+        dur = tc.collection_duration_s
+        if dur >= 3600:
+            dur_str = f"{dur // 3600}h{(dur % 3600) // 60:02d}m"
+        elif dur >= 60:
+            dur_str = f"{dur // 60}m"
+        else:
+            dur_str = f"{dur}s"
+        parts.append(f"{tc.sample_count} samples ({dur_str})")
+    else:
+        parts.append("Collecting")
+
+    # Correlation
+    if tc.correlation is not None:
+        parts.append(f"r={tc.correlation:.2f}")
+
+    return " | ".join(parts)
+
+
 class Display:
     """Curses display manager."""
 
@@ -167,7 +211,8 @@ class Display:
         lock_lost_seconds: Optional[int] = None,
         recovery_logs: Optional[list] = None,
         rms_history: Optional[list] = None,
-        rms_duration: int = 0
+        rms_duration: int = 0,
+        tempcomp_status: Optional[TempCompStatus] = None
     ):
         """Render the display with current status."""
         color = get_color_for_status(status)
@@ -199,6 +244,15 @@ class Display:
         gps_line = format_gps_line(status)
         if gps_line:
             self._addstr_centered(row, gps_line, curses.A_DIM)
+            row += 1
+
+        # Tempcomp status
+        if tempcomp_status is not None:
+            tc_line = format_tempcomp_line(tempcomp_status)
+            tc_attr = curses.A_DIM
+            if tempcomp_status.is_extrapolating:
+                tc_attr = curses.color_pair(Color.YELLOW)
+            self._addstr_centered(row, tc_line, tc_attr)
             row += 1
 
         # Lock lost timer (if applicable)

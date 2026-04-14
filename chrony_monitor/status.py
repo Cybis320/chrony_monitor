@@ -196,9 +196,12 @@ def get_tracking_info() -> Optional[TrackingInfo]:
         elif key == 'RMS offset':
             info.rms_offset_us = _parse_seconds_to_us(val)
         elif key == 'Frequency':
-            match = re.match(r'([+-]?\d+\.?\d*)', val)
+            match = re.match(r'([+-]?\d+\.?\d*)\s*ppm\s*(fast|slow)?', val)
             if match:
-                info.frequency_ppm = float(match.group(1))
+                freq = float(match.group(1))
+                if match.group(2) == 'slow':
+                    freq = -freq
+                info.frequency_ppm = freq
         elif key == 'Skew':
             match = re.match(r'([+-]?\d+\.?\d*)', val)
             if match:

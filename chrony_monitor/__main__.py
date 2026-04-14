@@ -78,6 +78,26 @@ Colors:
         help="Print current status and exit (no monitor UI)"
     )
 
+    parser.add_argument(
+        "--no-tempcomp",
+        action="store_true",
+        help="Disable temperature compensation monitoring"
+    )
+
+    parser.add_argument(
+        "--tempcomp-sensor",
+        type=str,
+        default="/sys/class/thermal/thermal_zone0/temp",
+        metavar="PATH",
+        help="Temperature sensor sysfs path (default: /sys/class/thermal/thermal_zone0/temp)"
+    )
+
+    parser.add_argument(
+        "--no-auto-recal",
+        action="store_true",
+        help="Disable automatic tempcomp recalibration"
+    )
+
     return parser
 
 
@@ -139,7 +159,10 @@ def main():
         ntp_only=args.ntp_only,
         recovery_enabled=not args.no_recovery,
         recovery_timeout=args.recovery_timeout,
-        recovery_cooldown=args.recovery_cooldown
+        recovery_cooldown=args.recovery_cooldown,
+        tempcomp_enabled=not args.no_tempcomp,
+        tempcomp_sensor=args.tempcomp_sensor,
+        tempcomp_auto_recal=not args.no_auto_recal
     )
 
     try:

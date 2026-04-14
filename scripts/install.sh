@@ -399,7 +399,11 @@ install_desktop_file() {
             info "Added $SUDO_USER to dialout group (re-login required)"
         fi
 
-        # Allow passwordless sudo for GPS/PPS service recovery
+        # Install tempcomp helper script
+        cp "$PROJECT_DIR/scripts/apply-tempcomp.sh" /usr/local/bin/apply-tempcomp.sh
+        chmod +x /usr/local/bin/apply-tempcomp.sh
+
+        # Allow passwordless sudo for GPS/PPS service recovery and tempcomp recalibration
         cat > /etc/sudoers.d/chrony-monitor << SUDOEOF
 $SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart gpsd.service
 $SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart chrony.service
@@ -407,6 +411,7 @@ $SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl stop gpsd.service
 $SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl stop chrony.service
 $SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start gpsd.service
 $SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start chrony.service
+$SUDO_USER ALL=(root) NOPASSWD: /usr/local/bin/apply-tempcomp.sh
 SUDOEOF
         if ! is_raspberry_pi; then
             cat >> /etc/sudoers.d/chrony-monitor << SUDOEOF

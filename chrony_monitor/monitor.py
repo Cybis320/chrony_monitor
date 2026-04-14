@@ -9,6 +9,7 @@ from typing import Optional
 from .status import get_status, get_gps_info, SyncState
 from .display import Display
 from .recovery import RecoveryManager, RecoveryConfig
+from .tempcomp import TempCompCollector, read_temperature
 
 
 @dataclass
@@ -19,6 +20,9 @@ class MonitorConfig:
     recovery_enabled: bool = True   # Enable auto-recovery
     recovery_timeout: int = 60      # Seconds before recovery attempt
     recovery_cooldown: int = 300    # Seconds between recovery attempts
+    tempcomp_enabled: bool = True   # Enable tempcomp monitoring
+    tempcomp_sensor: str = "/sys/class/thermal/thermal_zone0/temp"
+    tempcomp_auto_recal: bool = True  # Enable auto-recalibration
 
 
 class Monitor:
@@ -42,6 +46,13 @@ class Monitor:
         self._rms_minute_count = 0
         self._last_good_status = None
         self._error_count = 0
+        self.tempcomp = None
+        if self.config.tempcomp_enabled:
+            self.tempcomp = TempCompCollector(
+                sensor_path=self.config.tempcomp_sensor,
+                auto_recal=self.config.tempcomp_auto_recal
+            )
+            self.tempcomp.load()
 
     def _get_gps_cached(self):
         """Get GPS info, refreshing every 10 seconds."""
@@ -83,6 +94,14 @@ class Monitor:
                     self._rms_minute_bucket.clear()
                     self._rms_minute_count = 0
 
+            # Record tempcomp data
+            tempcomp_status = None
+            if self.tempcomp and status.tracking:
+                temp = read_temperature(self.tempcomp.sensor_path)
+                if temp is not None and status.tracking.frequency_ppm != 0:
+                    self.tempcomp.record(temp, status.tracking.frequency_ppm)
+                tempcomp_status = self.tempcomp.get_status()
+
             # Handle recovery logic for PPS mode
             if status.pps_expected and self.config.recovery_enabled:
                 self._handle_recovery(status)
@@ -102,7 +121,8 @@ class Monitor:
                 lock_lost_seconds=lock_lost_seconds,
                 recovery_logs=self.recovery_manager.get_recent_logs(),
                 rms_history=rms_combined,
-                rms_duration=rms_duration
+                rms_duration=rms_duration,
+                tempcomp_status=tempcomp_status
             )
 
             time.sleep(self.config.interval)
