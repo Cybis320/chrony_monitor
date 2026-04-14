@@ -40,6 +40,7 @@ class SourceInfo:
     last_rx: str
     offset: float       # in milliseconds
     error: float        # in milliseconds
+    std_dev: float      # in milliseconds, from sourcestats
     is_selected: bool
     is_pps: bool
     is_gps: bool
@@ -252,6 +253,35 @@ def get_gps_info() -> Optional[GpsInfo]:
     return info if info.satellites_used > 0 else None
 
 
+def get_sourcestats() -> dict:
+    """
+    Get source statistics from chronyc sourcestats.
+    Returns: dict mapping source name to std_dev in milliseconds.
+    """
+    try:
+        out = subprocess.check_output(
+            ["chronyc", "sourcestats", "-n"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return {}
+
+    # Example: GPPS                        7   4    96     -0.001      0.038     -7ns   464ns
+    # Columns: Name NP NR Span Frequency FreqSkew Offset StdDev
+    stats = {}
+    for line in out.splitlines():
+        if not line.strip() or line.startswith('Name') or line.startswith('=='):
+            continue
+        cols = line.split()
+        if len(cols) >= 8:
+            name = cols[0]
+            std_dev = parse_offset(cols[-1])  # last column is Std Dev
+            stats[name] = abs(std_dev)
+    return stats
+
+
 def get_chrony_sources() -> tuple:
     """
     Get chrony sources information.
@@ -270,6 +300,9 @@ def get_chrony_sources() -> tuple:
         return False, [], e.output.strip() or "chronyd not running"
     except subprocess.TimeoutExpired:
         return False, [], "chronyc timeout"
+
+    # Get sourcestats for std_dev values
+    stats = get_sourcestats()
 
     sources = []
     for line in out.splitlines():
@@ -327,6 +360,7 @@ def get_chrony_sources() -> tuple:
             last_rx=last_rx,
             offset=abs(offset),
             error=abs(error),
+            std_dev=stats.get(name, 0.0),
             is_selected=is_selected,
             is_pps=is_pps,
             is_gps=is_gps

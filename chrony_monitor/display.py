@@ -99,24 +99,26 @@ def format_offset(offset_ms: Optional[float]) -> str:
     return f"{offset_ms / 1000:.2f}s"
 
 
-def format_confidence_line(status: ChronyStatus) -> str:
-    """Format time confidence line."""
-    parts = []
+def format_confidence_lines(status: ChronyStatus) -> tuple:
+    """Format time confidence as two lines: accuracy metrics + system info."""
+    line1_parts = []
+    line2_parts = []
     if status.tracking:
         t = status.tracking
-        if status.selected_source:
-            parts.append(f"Bound ±{format_us(status.selected_source.error * 1000)}")
+        if status.selected_source and status.selected_source.std_dev > 0:
+            line1_parts.append(f"StdDev {format_us(status.selected_source.std_dev * 1000)}")
         else:
-            parts.append(f"Bound ±{format_us(t.root_dispersion_us)}")
-        parts.append(f"RMS {format_us(t.rms_offset_us)}")
-        parts.append(f"Skew {t.skew_ppm:.3f}ppm")
-        parts.append(f"Poll {t.update_interval:.0f}s")
-        parts.append(f"Stratum {t.stratum}")
-    if parts:
-        return " | ".join(parts)
+            line1_parts.append(f"Bound ±{format_us(t.root_dispersion_us)}")
+        line1_parts.append(f"RMS {format_us(t.rms_offset_us)}")
+        line1_parts.append(f"Freq {t.frequency_ppm:.3f}ppm")
+        line1_parts.append(f"Skew {t.skew_ppm:.3f}ppm")
+        line2_parts.append(f"Poll {t.update_interval:.0f}s")
+        line2_parts.append(f"Stratum {t.stratum}")
+    if line1_parts:
+        return " | ".join(line1_parts), " | ".join(line2_parts)
     if status.error_message:
-        return status.error_message
-    return "No tracking data"
+        return status.error_message, ""
+    return "No tracking data", ""
 
 
 def format_us(us: float) -> str:
@@ -180,10 +182,13 @@ class Display:
         self._addstr_centered(row, banner, curses.A_BOLD)
         row += 2
 
-        # Confidence line
-        confidence = format_confidence_line(status)
-        self._addstr_centered(row, confidence)
+        # Confidence lines
+        conf_line1, conf_line2 = format_confidence_lines(status)
+        self._addstr_centered(row, conf_line1)
         row += 1
+        if conf_line2:
+            self._addstr_centered(row, conf_line2, curses.A_DIM)
+            row += 1
 
         # Source info line
         info = format_source_info(status)
