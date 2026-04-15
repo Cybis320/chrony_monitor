@@ -199,6 +199,25 @@ def _residual_slope(temps: list, freqs: list) -> float:
     return (n * sxy - sx * sy) / denom
 
 
+def _filter_outliers(temps: list, freqs: list) -> tuple:
+    """Remove frequency outliers using IQR method.
+
+    Returns filtered (temps, freqs) lists with outliers removed.
+    """
+    if len(freqs) < 20:
+        return temps, freqs
+    freqs_sorted = sorted(freqs)
+    q1 = freqs_sorted[len(freqs_sorted) // 4]
+    q3 = freqs_sorted[3 * len(freqs_sorted) // 4]
+    iqr = q3 - q1
+    lower = q1 - 3.0 * iqr
+    upper = q3 + 3.0 * iqr
+    filtered = [(t, f) for t, f in zip(temps, freqs) if lower <= f <= upper]
+    if not filtered:
+        return temps, freqs
+    return [t for t, f in filtered], [f for t, f in filtered]
+
+
 class TempCompCollector:
     """Collects temperature/frequency data for tempcomp calibration."""
 
@@ -304,15 +323,15 @@ class TempCompCollector:
                     and temp_range_c >= MIN_TEMP_RANGE_CORRELATION):
                 now = time.time()
                 if self._cached_correlation is None or now - self._correlation_time > 60:
-                    temps_md = list(self._temps)
-                    freqs = list(self._freqs)
-                    T0, k0, k1, k2 = _polyfit_quadratic(temps_md, freqs)
-                    predicted = [k0 + k1 * (t - T0) + k2 * (t - T0) ** 2
-                                 for t in temps_md]
-                    ss_res = sum((f - p) ** 2 for f, p in zip(freqs, predicted))
-                    mean_f = sum(freqs) / len(freqs)
-                    ss_tot = sum((f - mean_f) ** 2 for f in freqs)
-                    self._cached_correlation = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                    temps_md, freqs = _filter_outliers(list(self._temps), list(self._freqs))
+                    if len(freqs) >= MIN_SAMPLES_CORRELATION:
+                        T0, k0, k1, k2 = _polyfit_quadratic(temps_md, freqs)
+                        predicted = [k0 + k1 * (t - T0) + k2 * (t - T0) ** 2
+                                     for t in temps_md]
+                        ss_res = sum((f - p) ** 2 for f, p in zip(freqs, predicted))
+                        mean_f = sum(freqs) / len(freqs)
+                        ss_tot = sum((f - mean_f) ** 2 for f in freqs)
+                        self._cached_correlation = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0
                     self._correlation_time = now
                 status.correlation = self._cached_correlation
 
@@ -351,9 +370,10 @@ class TempCompCollector:
         if temp_range < MIN_TEMP_RANGE_FIT:
             return
 
-        # Compute new fit from raw data
-        temps_md = list(self._temps)
-        freqs = list(self._freqs)
+        # Compute new fit from raw data (outliers filtered)
+        temps_md, freqs = _filter_outliers(list(self._temps), list(self._freqs))
+        if len(freqs) < MIN_SAMPLES_FIT:
+            return
         new_T0, new_k0, new_k1, new_k2 = _polyfit_quadratic(temps_md, freqs)
 
         # Check compensation value is within chrony's ±10 ppm limit
@@ -498,12 +518,12 @@ class TempCompCollector:
         return (T0_c - 10.0, T0_c + 10.0)
 
     def _load_csv(self):
-        """Read existing CSV into deques. Prune entries older than 30 days."""
+        """Read existing CSV into deques. Prune old entries and outliers."""
         if not os.path.exists(self._csv_path):
             return
 
         cutoff = int(time.time()) - MAX_DATA_DAYS * 86400
-        rows_to_keep = []
+        raw_rows = []
 
         try:
             with open(self._csv_path) as f:
@@ -521,20 +541,29 @@ class TempCompCollector:
                     except ValueError:
                         continue
                     if ts >= cutoff:
-                        rows_to_keep.append((ts, temp, freq))
-                        self._timestamps.append(ts)
-                        self._temps.append(temp)
-                        self._freqs.append(freq)
+                        raw_rows.append((ts, temp, freq))
         except OSError:
             return
 
-        # Rewrite file if we pruned old entries
-        try:
-            total = sum(1 for line in open(self._csv_path) if line.strip())
-            if len(rows_to_keep) < total:
-                self._rewrite_csv(rows_to_keep)
-        except OSError:
-            pass
+        # Filter outliers using IQR on frequency
+        rows_to_keep = raw_rows
+        if len(raw_rows) >= 20:
+            freqs_sorted = sorted(r[2] for r in raw_rows)
+            q1 = freqs_sorted[len(freqs_sorted) // 4]
+            q3 = freqs_sorted[3 * len(freqs_sorted) // 4]
+            iqr = q3 - q1
+            lower = q1 - 3.0 * iqr
+            upper = q3 + 3.0 * iqr
+            rows_to_keep = [r for r in raw_rows if lower <= r[2] <= upper]
+
+        for ts, temp, freq in rows_to_keep:
+            self._timestamps.append(ts)
+            self._temps.append(temp)
+            self._freqs.append(freq)
+
+        # Rewrite file if we pruned anything
+        if len(rows_to_keep) < len(raw_rows):
+            self._rewrite_csv(rows_to_keep)
 
     def _append_csv(self, ts: int, temp: float, freq: float):
         """Append one row to the CSV file."""
