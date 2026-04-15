@@ -99,13 +99,13 @@ class Monitor:
             tempcomp_status = None
             if self.tempcomp and status.tracking:
                 temp = read_temperature(self.tempcomp.sensor_path)
-                if status.tracking.skew_ppm < 0.01:
+                if status.tracking.skew_ppm < 0.035:
                     self._stable_count += 1
                 else:
                     self._stable_count = 0
                 if (temp is not None
                         and status.tracking.frequency_ppm != 0
-                        and self._stable_count >= 120):
+                        and self._stable_count >= 60):
                     self.tempcomp.record(temp, status.tracking.frequency_ppm)
                 tempcomp_status = self.tempcomp.get_status()
 
@@ -130,7 +130,7 @@ class Monitor:
                 rms_history=rms_combined,
                 rms_duration=rms_duration,
                 tempcomp_status=tempcomp_status,
-                converging=self._stable_count < 120
+                converging=self._stable_count < 60
             )
 
             time.sleep(self.config.interval)
