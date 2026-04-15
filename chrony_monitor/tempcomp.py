@@ -226,6 +226,7 @@ class TempCompCollector:
         self._config: Optional[TempCompConfig] = None
         self._start_time: float = 0
         self._last_recal_time: float = 0
+        self._last_attempt_time: float = 0
 
         # Cached correlation
         self._cached_correlation: Optional[float] = None
@@ -336,9 +337,9 @@ class TempCompCollector:
 
     def _check_recalibration(self):
         """Check if recalibration is warranted and apply if so."""
-        # Enforce minimum interval between recalibrations
+        # Enforce minimum interval between recalibrations (also covers failed attempts)
         now = time.time()
-        if self._last_recal_time > 0 and now - self._last_recal_time < MIN_RECAL_INTERVAL:
+        if self._last_attempt_time > 0 and now - self._last_attempt_time < MIN_RECAL_INTERVAL:
             return
 
         # Need enough data
@@ -397,6 +398,7 @@ class TempCompCollector:
 
     def _apply_calibration(self, T0: float, k0: float, k1: float, k2: float):
         """Write proposed tempcomp and apply via the helper script."""
+        self._last_attempt_time = time.time()
         sensor = self.sensor_path
         new_line = f"tempcomp {sensor} 30 {T0:.0f} {k0:.6f} {k1:.10f} {k2:.12f}"
 

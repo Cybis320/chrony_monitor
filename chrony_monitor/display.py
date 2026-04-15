@@ -369,7 +369,7 @@ class Display:
     def _render_section(self, row: int, w: int, label: str, content: str,
                         content_attr: int = 0) -> int:
         """Render a section as: 'Label >>>  content' on one line."""
-        prefix = f"{label:>{self.LABEL_WIDTH}} \u00bb  "
+        prefix = f"{label:>{self.LABEL_WIDTH}} >>> "
         self._addstr(row, 1, prefix, curses.A_DIM)
         self._addstr(row, 2 + len(prefix), content, content_attr)
         row += 1
