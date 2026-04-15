@@ -250,6 +250,7 @@ class TempCompCollector:
         self._last_prune_time: float = 0
         self._cal_range_path = os.path.join(data_dir, "cal_range")
         self._cal_range: Optional[tuple] = None  # (min_C, max_C) from last calibration
+        self._was_extrapolating: bool = False
 
         # Cached correlation and fit
         self._cached_correlation: Optional[float] = None
@@ -382,14 +383,22 @@ class TempCompCollector:
                     self._correlation_time = now
                 status.correlation = self._cached_correlation
 
-        # Extrapolation check
+        # Extrapolation check with hysteresis
         if self._config and self._config.is_active and status.current_temp_c is not None:
             cal_range = self._get_calibration_range()
             if cal_range:
                 cal_min, cal_max = cal_range
                 status.cal_range = cal_range
-                if status.current_temp_c < cal_min - 1.0 or status.current_temp_c > cal_max + 1.0:
-                    status.is_extrapolating = True
+                t = status.current_temp_c
+                if self._was_extrapolating:
+                    # Clear only when well inside range
+                    if cal_min <= t <= cal_max:
+                        self._was_extrapolating = False
+                else:
+                    # Trigger when clearly outside range
+                    if t < cal_min - 2.0 or t > cal_max + 2.0:
+                        self._was_extrapolating = True
+                status.is_extrapolating = self._was_extrapolating
 
         if self._last_recal_time > 0:
             ago = int(time.time() - self._last_recal_time)

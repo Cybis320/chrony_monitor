@@ -251,9 +251,9 @@ class Display:
                 tc_attr = curses.color_pair(Color.YELLOW)
             row = self._render_section(row, w, "TempComp", tc_line1, tc_attr)
             if tc_line2:
-                # Indent second line to align with content column
-                prefix = " " * (self.LABEL_WIDTH + 5)
-                self._addstr(row, 1, prefix + tc_line2, curses.A_DIM)
+                # Align with content column (same as _render_section)
+                content_col = 2 + self.LABEL_WIDTH + 5
+                self._addstr(row, content_col, tc_line2, curses.A_DIM)
                 row += 1
 
         # Lock lost timer (if applicable)
