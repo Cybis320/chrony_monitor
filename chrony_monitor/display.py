@@ -173,9 +173,12 @@ def format_tempcomp_line(tc: TempCompStatus) -> str:
     else:
         parts.append("TempComp: off")
 
-    # Current temperature
+    # Current temperature and range
     if tc.current_temp_c is not None:
-        parts.append(f"{tc.current_temp_c:.1f}C")
+        if tc.temp_range:
+            parts.append(f"{tc.current_temp_c:.1f}C ({tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C)")
+        else:
+            parts.append(f"{tc.current_temp_c:.1f}C")
 
     # Collection status
     if tc.sample_count > 0:
