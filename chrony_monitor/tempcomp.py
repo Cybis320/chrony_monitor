@@ -50,6 +50,7 @@ class TempCompStatus:
     temp_range: Optional[tuple] = None      # (min_C, max_C)
     correlation: Optional[float] = None
     is_extrapolating: bool = False
+    cal_range: Optional[tuple] = None       # (min_C, max_C) from calibration
     last_recal: Optional[str] = None        # human-readable last recalibration
 
 
@@ -247,6 +248,8 @@ class TempCompCollector:
         self._last_recal_time: float = 0
         self._last_attempt_time: float = 0
         self._last_prune_time: float = 0
+        self._cal_range_path = os.path.join(data_dir, "cal_range")
+        self._cal_range: Optional[tuple] = None  # (min_C, max_C) from last calibration
 
         # Cached correlation and fit
         self._cached_correlation: Optional[float] = None
@@ -290,6 +293,7 @@ class TempCompCollector:
         self._config = parse_chrony_tempcomp()
         self._load_csv()
         self._load_recal_time()
+        self._load_cal_range()
         self._update_fit()  # build initial fit from loaded data
 
     def record(self, temp_millideg: float, frequency_ppm: float):
@@ -380,9 +384,10 @@ class TempCompCollector:
 
         # Extrapolation check
         if self._config and self._config.is_active and status.current_temp_c is not None:
-            cal_range = self._estimate_calibration_range()
+            cal_range = self._get_calibration_range()
             if cal_range:
                 cal_min, cal_max = cal_range
+                status.cal_range = cal_range
                 if status.current_temp_c < cal_min - 1.0 or status.current_temp_c > cal_max + 1.0:
                     status.is_extrapolating = True
 
@@ -503,7 +508,7 @@ class TempCompCollector:
             self._log_recal(f"Failed: {e}")
             return
 
-        # Success — update in-memory config
+        # Success — update in-memory config and save calibration range
         self._last_recal_time = time.time()
         conf_path = self._config.conf_path if self._config else ""
         self._config = TempCompConfig(
@@ -511,8 +516,11 @@ class TempCompCollector:
             T0=T0, k0=k0, k1=k1, k2=k2,
             is_active=True, conf_path=conf_path
         )
-        temp_range = f"{min(self._temps)/1000:.0f}-{max(self._temps)/1000:.0f}C"
-        self._log_recal(f"Recalibrated: T0={T0:.0f} k1={k1:.6e} range={temp_range}")
+        cal_min = min(self._temps) / 1000.0
+        cal_max = max(self._temps) / 1000.0
+        self._cal_range = (cal_min, cal_max)
+        self._save_cal_range()
+        self._log_recal(f"Recalibrated: T0={T0:.0f} k1={k1:.6e} range={cal_min:.0f}-{cal_max:.0f}C")
 
     def _log_recal(self, msg: str):
         """Log a recalibration event."""
@@ -547,16 +555,34 @@ class TempCompCollector:
         except OSError:
             pass
 
-    def _estimate_calibration_range(self) -> Optional[tuple]:
-        """Estimate the temperature range the current tempcomp was calibrated on."""
+    def _save_cal_range(self):
+        """Persist the calibration temperature range."""
+        if self._cal_range is None:
+            return
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(self._cal_range_path, 'w') as f:
+                f.write(f"{self._cal_range[0]:.1f},{self._cal_range[1]:.1f}\n")
+        except OSError:
+            pass
+
+    def _load_cal_range(self):
+        """Load the calibration temperature range."""
+        try:
+            with open(self._cal_range_path) as f:
+                parts = f.read().strip().split(',')
+                if len(parts) == 2:
+                    self._cal_range = (float(parts[0]), float(parts[1]))
+        except (OSError, ValueError):
+            pass
+
+    def _get_calibration_range(self) -> Optional[tuple]:
+        """Get the temperature range the current calibration covers."""
+        if self._cal_range:
+            return self._cal_range
         if not self._config:
             return None
-
-        if len(self._temps) >= MIN_SAMPLES_CORRELATION:
-            min_t = min(self._temps) / 1000.0
-            max_t = max(self._temps) / 1000.0
-            return (min_t, max_t)
-
+        # Fallback: estimate ±10°C around T0
         T0_c = self._config.T0 / 1000.0
         return (T0_c - 10.0, T0_c + 10.0)
 

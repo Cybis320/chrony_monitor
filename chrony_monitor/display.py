@@ -164,19 +164,21 @@ def format_tempcomp_line(tc: TempCompStatus) -> str:
     """Format temperature compensation status line."""
     parts = []
 
-    # State
+    # State and calibration range
     if tc.config and tc.config.is_active:
-        if tc.is_extrapolating:
-            parts.append(f"OUTSIDE CAL ({tc.current_temp_c:.0f}C)")
+        if tc.is_extrapolating and tc.cal_range:
+            parts.append(f"OUTSIDE CAL ({tc.current_temp_c:.0f}C > {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C)")
+        elif tc.cal_range:
+            parts.append(f"Active {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C")
         else:
             parts.append("Active")
     else:
         parts.append("Off")
 
-    # Current temperature and range
+    # Current temperature and data range
     if tc.current_temp_c is not None:
         if tc.temp_range:
-            parts.append(f"{tc.current_temp_c:.1f}C ({tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C)")
+            parts.append(f"{tc.current_temp_c:.1f}C (data {tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C)")
         else:
             parts.append(f"{tc.current_temp_c:.1f}C")
 
