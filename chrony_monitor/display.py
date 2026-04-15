@@ -160,29 +160,29 @@ def format_us(us: float) -> str:
     return f"{us / 1000000:.2f}s"
 
 
-def format_tempcomp_line(tc: TempCompStatus) -> str:
-    """Format temperature compensation status line."""
-    parts = []
+def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
+    """Format temperature compensation as two lines."""
+    line1 = []
+    line2 = []
 
-    # State and calibration range
+    # Line 1: state, current temp, calibration range
     if tc.config and tc.config.is_active:
         if tc.is_extrapolating and tc.cal_range:
-            parts.append(f"OUTSIDE CAL ({tc.current_temp_c:.0f}C > {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C)")
+            line1.append(f"OUTSIDE CAL ({tc.current_temp_c:.0f}C > {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C)")
         elif tc.cal_range:
-            parts.append(f"Active {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C")
+            line1.append(f"Active {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C")
         else:
-            parts.append("Active")
+            line1.append("Active")
     else:
-        parts.append("Off")
+        line1.append("Off")
 
-    # Current temperature and data range
     if tc.current_temp_c is not None:
-        if tc.temp_range:
-            parts.append(f"{tc.current_temp_c:.1f}C (data {tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C)")
-        else:
-            parts.append(f"{tc.current_temp_c:.1f}C")
+        line1.append(f"{tc.current_temp_c:.1f}C")
 
-    # Collection status
+    if tc.correlation is not None:
+        line1.append(f"R2={tc.correlation:.4f}")
+
+    # Line 2: collection stats and data range
     if tc.sample_count > 0:
         dur = tc.collection_duration_s
         if dur >= 3600:
@@ -191,15 +191,14 @@ def format_tempcomp_line(tc: TempCompStatus) -> str:
             dur_str = f"{dur // 60}m"
         else:
             dur_str = f"{dur}s"
-        parts.append(f"{tc.sample_count} samples ({dur_str})")
+        line2.append(f"{tc.sample_count} samples ({dur_str})")
     else:
-        parts.append("Collecting")
+        line2.append("Collecting")
 
-    # Correlation
-    if tc.correlation is not None:
-        parts.append(f"R2={tc.correlation:.4f}")
+    if tc.temp_range:
+        line2.append(f"data {tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C")
 
-    return " | ".join(parts)
+    return " | ".join(line1), " | ".join(line2)
 
 
 class Display:
@@ -246,11 +245,16 @@ class Display:
 
         # TempComp section
         if tempcomp_status is not None:
-            tc_line = format_tempcomp_line(tempcomp_status)
+            tc_line1, tc_line2 = format_tempcomp_lines(tempcomp_status)
             tc_attr = curses.A_DIM
             if tempcomp_status.is_extrapolating:
                 tc_attr = curses.color_pair(Color.YELLOW)
-            row = self._render_section(row, w, "TempComp", tc_line, tc_attr)
+            row = self._render_section(row, w, "TempComp", tc_line1, tc_attr)
+            if tc_line2:
+                # Indent second line to align with content column
+                prefix = " " * (self.LABEL_WIDTH + 5)
+                self._addstr(row, 1, prefix + tc_line2, curses.A_DIM)
+                row += 1
 
         # Lock lost timer (if applicable)
         if lock_lost_seconds is not None and lock_lost_seconds > 0:
