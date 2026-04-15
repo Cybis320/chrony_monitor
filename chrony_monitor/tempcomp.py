@@ -248,12 +248,41 @@ class TempCompCollector:
         self._last_attempt_time: float = 0
         self._last_prune_time: float = 0
 
-        # Cached correlation
+        # Cached correlation and fit
         self._cached_correlation: Optional[float] = None
         self._correlation_time: float = 0
+        self._fit: Optional[tuple] = None    # (T0, k0, k1, k2)
+        self._fit_residual_std: float = 0.0  # σ of residuals
+        self._fit_time: float = 0
 
         # Recalibration logs (shown in display)
         self.recal_logs: list = []
+
+    def _update_fit(self):
+        """Recompute the quadratic fit and residual std dev. Called periodically."""
+        now = time.time()
+        if now - self._fit_time < 300:  # refit every 5 min at most
+            return
+        temps_md, freqs = _filter_outliers(list(self._temps), list(self._freqs))
+        if len(freqs) < MIN_SAMPLES_CORRELATION:
+            return
+        T0, k0, k1, k2 = _polyfit_quadratic(temps_md, freqs)
+        residuals = [f - (k0 + k1 * (t - T0) + k2 * (t - T0) ** 2)
+                     for t, f in zip(temps_md, freqs)]
+        n = len(residuals)
+        self._fit = (T0, k0, k1, k2)
+        self._fit_residual_std = math.sqrt(sum(r * r for r in residuals) / n)
+        self._fit_time = now
+
+    def _is_outlier(self, temp_millideg: float, freq_ppm: float) -> bool:
+        """Check if a sample is an outlier based on the current fit."""
+        if self._fit is None:
+            return False  # no fit yet, accept everything
+        T0, k0, k1, k2 = self._fit
+        predicted = k0 + k1 * (temp_millideg - T0) + k2 * (temp_millideg - T0) ** 2
+        residual = abs(freq_ppm - predicted)
+        # Reject if residual > 3σ (99.7% of good data passes)
+        return residual > 3.0 * self._fit_residual_std if self._fit_residual_std > 0 else False
 
     def load(self):
         """Load persistent data and parse chrony.conf. Call once at startup."""
@@ -261,6 +290,7 @@ class TempCompCollector:
         self._config = parse_chrony_tempcomp()
         self._load_csv()
         self._load_recal_time()
+        self._update_fit()  # build initial fit from loaded data
 
     def record(self, temp_millideg: float, frequency_ppm: float):
         """Record a (temp, freq) pair. Called every 1s from the monitor loop.
@@ -281,17 +311,22 @@ class TempCompCollector:
         if self._minute_count >= 60:
             avg_temp = sum(self._minute_temps) / len(self._minute_temps)
             avg_freq = sum(self._minute_freqs) / len(self._minute_freqs)
-            ts = int(time.time())
+            self._minute_temps.clear()
+            self._minute_freqs.clear()
+            self._minute_count = 0
 
+            # Reject outliers based on current fit
+            if self._is_outlier(avg_temp, avg_freq):
+                return
+
+            ts = int(time.time())
             self._temps.append(avg_temp)
             self._freqs.append(avg_freq)
             self._timestamps.append(ts)
 
             self._append_csv(ts, avg_temp, avg_freq)
-            self._minute_temps.clear()
-            self._minute_freqs.clear()
-            self._minute_count = 0
             self._cached_correlation = None
+            self._update_fit()
 
             # Prune CSV daily to match deque contents
             now = time.time()

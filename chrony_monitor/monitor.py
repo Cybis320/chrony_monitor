@@ -9,7 +9,7 @@ from typing import Optional
 from .status import get_status, get_gps_info, SyncState
 from .display import Display
 from .recovery import RecoveryManager, RecoveryConfig
-from .tempcomp import TempCompCollector, read_temperature
+from .tempcomp import TempCompCollector, read_temperature, _compute_compensation
 
 
 @dataclass
@@ -46,7 +46,6 @@ class Monitor:
         self._rms_minute_count = 0
         self._last_good_status = None
         self._error_count = 0
-        self._stable_count = 0  # consecutive seconds with low skew
         self.tempcomp = None
         if self.config.tempcomp_enabled:
             self.tempcomp = TempCompCollector(
@@ -97,15 +96,16 @@ class Monitor:
 
             # Record tempcomp data
             tempcomp_status = None
+            converging = False
             if self.tempcomp and status.tracking:
                 temp = read_temperature(self.tempcomp.sensor_path)
-                if status.tracking.skew_ppm < 0.035:
-                    self._stable_count += 1
-                else:
-                    self._stable_count = 0
-                if (temp is not None
-                        and status.tracking.frequency_ppm != 0
-                        and self._stable_count >= 60):
+                if temp is not None and status.tracking.frequency_ppm != 0:
+                    # Reconstruct raw freq for outlier check
+                    raw_freq = status.tracking.frequency_ppm
+                    if self.tempcomp._config and self.tempcomp._config.is_active:
+                        raw_freq += _compute_compensation(
+                            self.tempcomp._config, temp)
+                    converging = self.tempcomp._is_outlier(temp, raw_freq)
                     self.tempcomp.record(temp, status.tracking.frequency_ppm)
                 tempcomp_status = self.tempcomp.get_status()
 
@@ -130,7 +130,7 @@ class Monitor:
                 rms_history=rms_combined,
                 rms_duration=rms_duration,
                 tempcomp_status=tempcomp_status,
-                converging=self._stable_count < 60
+                converging=converging
             )
 
             time.sleep(self.config.interval)
