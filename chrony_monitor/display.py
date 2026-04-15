@@ -195,7 +195,7 @@ def format_tempcomp_line(tc: TempCompStatus) -> str:
 
     # Correlation
     if tc.correlation is not None:
-        parts.append(f"R2={tc.correlation:.2f}")
+        parts.append(f"R2={tc.correlation:.4f}")
 
     return " | ".join(parts)
 
