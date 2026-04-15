@@ -78,13 +78,9 @@ def get_banner_text(status: ChronyStatus) -> str:
         return "RECOVERING"
 
     if state == SyncState.GPPS_LOCKED:
-        if status.tracking and status.tracking.skew_ppm >= 0.01:
-            return "GPPS LOCKED - CONVERGING"
         return "GPPS LOCKED"
 
     if state == SyncState.NTP_SYNCED:
-        if status.tracking and status.tracking.skew_ppm >= 0.01:
-            return "NTP SYNCED - CONVERGING"
         return "NTP SYNCED"
 
     return "UNKNOWN"
@@ -219,7 +215,8 @@ class Display:
         recovery_logs: Optional[list] = None,
         rms_history: Optional[list] = None,
         rms_duration: int = 0,
-        tempcomp_status: Optional[TempCompStatus] = None
+        tempcomp_status: Optional[TempCompStatus] = None,
+        converging: bool = False
     ):
         """Render the display with current status."""
         color = get_color_for_status(status)
@@ -231,6 +228,8 @@ class Display:
 
         # Main banner
         banner = get_banner_text(status)
+        if converging:
+            banner += " - CONVERGING"
         self._addstr_centered(row, banner, curses.A_BOLD)
         row += 2
 

@@ -46,6 +46,7 @@ class Monitor:
         self._rms_minute_count = 0
         self._last_good_status = None
         self._error_count = 0
+        self._stable_count = 0  # consecutive seconds with low skew
         self.tempcomp = None
         if self.config.tempcomp_enabled:
             self.tempcomp = TempCompCollector(
@@ -98,9 +99,13 @@ class Monitor:
             tempcomp_status = None
             if self.tempcomp and status.tracking:
                 temp = read_temperature(self.tempcomp.sensor_path)
+                if status.tracking.skew_ppm < 0.01:
+                    self._stable_count += 1
+                else:
+                    self._stable_count = 0
                 if (temp is not None
                         and status.tracking.frequency_ppm != 0
-                        and status.tracking.skew_ppm < 0.01):
+                        and self._stable_count >= 120):
                     self.tempcomp.record(temp, status.tracking.frequency_ppm)
                 tempcomp_status = self.tempcomp.get_status()
 
@@ -124,7 +129,8 @@ class Monitor:
                 recovery_logs=self.recovery_manager.get_recent_logs(),
                 rms_history=rms_combined,
                 rms_duration=rms_duration,
-                tempcomp_status=tempcomp_status
+                tempcomp_status=tempcomp_status,
+                converging=self._stable_count < 120
             )
 
             time.sleep(self.config.interval)
