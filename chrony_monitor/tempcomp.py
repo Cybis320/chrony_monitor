@@ -298,8 +298,15 @@ class TempCompCollector:
                     and temp_range_c >= MIN_TEMP_RANGE_CORRELATION):
                 now = time.time()
                 if self._cached_correlation is None or now - self._correlation_time > 60:
-                    temps_c = [t / 1000.0 for t in self._temps]
-                    self._cached_correlation = _pearson_r(temps_c, list(self._freqs))
+                    temps_md = list(self._temps)
+                    freqs = list(self._freqs)
+                    T0, k0, k1, k2 = _polyfit_quadratic(temps_md, freqs)
+                    predicted = [k0 + k1 * (t - T0) + k2 * (t - T0) ** 2
+                                 for t in temps_md]
+                    ss_res = sum((f - p) ** 2 for f, p in zip(freqs, predicted))
+                    mean_f = sum(freqs) / len(freqs)
+                    ss_tot = sum((f - mean_f) ** 2 for f in freqs)
+                    self._cached_correlation = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0
                     self._correlation_time = now
                 status.correlation = self._cached_correlation
 
@@ -370,10 +377,15 @@ class TempCompCollector:
             if improvement < MIN_IMPROVEMENT:
                 return
         else:
-            # No active tempcomp — check if correlation is strong enough to warrant enabling
-            r = _pearson_r(temps_c, freqs)
-            if abs(r) < 0.8:
-                return  # not enough temperature-frequency correlation
+            # No active tempcomp — check if quadratic fit explains enough variance
+            predicted = [new_k0 + new_k1 * (t - new_T0) + new_k2 * (t - new_T0) ** 2
+                         for t in temps_md]
+            ss_res = sum((f - p) ** 2 for f, p in zip(freqs, predicted))
+            mean_f = sum(freqs) / len(freqs)
+            ss_tot = sum((f - mean_f) ** 2 for f in freqs)
+            r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0
+            if r_squared < 0.6:
+                return  # temperature doesn't explain enough frequency variance
 
         # Apply the new calibration
         self._apply_calibration(new_T0, new_k0, new_k1, new_k2)
