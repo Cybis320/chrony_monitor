@@ -78,12 +78,12 @@ def get_banner_text(status: ChronyStatus) -> str:
         return "RECOVERING"
 
     if state == SyncState.GPPS_LOCKED:
-        if status.tracking and status.tracking.skew_ppm >= 0.05:
+        if status.tracking and status.tracking.skew_ppm >= 0.01:
             return "GPPS LOCKED - CONVERGING"
         return "GPPS LOCKED"
 
     if state == SyncState.NTP_SYNCED:
-        if status.tracking and status.tracking.skew_ppm >= 0.05:
+        if status.tracking and status.tracking.skew_ppm >= 0.01:
             return "NTP SYNCED - CONVERGING"
         return "NTP SYNCED"
 

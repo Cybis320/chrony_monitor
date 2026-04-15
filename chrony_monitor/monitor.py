@@ -100,7 +100,7 @@ class Monitor:
                 temp = read_temperature(self.tempcomp.sensor_path)
                 if (temp is not None
                         and status.tracking.frequency_ppm != 0
-                        and status.tracking.skew_ppm < 0.05):
+                        and status.tracking.skew_ppm < 0.01):
                     self.tempcomp.record(temp, status.tracking.frequency_ppm)
                 tempcomp_status = self.tempcomp.get_status()
 
