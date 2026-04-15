@@ -246,6 +246,7 @@ class TempCompCollector:
         self._start_time: float = 0
         self._last_recal_time: float = 0
         self._last_attempt_time: float = 0
+        self._last_prune_time: float = 0
 
         # Cached correlation
         self._cached_correlation: Optional[float] = None
@@ -291,6 +292,13 @@ class TempCompCollector:
             self._minute_freqs.clear()
             self._minute_count = 0
             self._cached_correlation = None
+
+            # Prune CSV daily to match deque contents
+            now = time.time()
+            if now - self._last_prune_time > 86400:
+                rows = list(zip(self._timestamps, self._temps, self._freqs))
+                self._rewrite_csv(rows)
+                self._last_prune_time = now
 
             # Check if auto-recalibration is warranted
             if self.auto_recal:
