@@ -165,16 +165,19 @@ def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
     line1 = []
     line2 = []
 
-    # Line 1: state, current temp, calibration range
+    # Line 1: state, temp, range
     if tc.config and tc.config.is_active:
         if tc.is_extrapolating and tc.cal_range:
-            line1.append(f"OUTSIDE CAL ({tc.current_temp_c:.0f}C > {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C)")
+            line1.append(f"OUTSIDE {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C")
         elif tc.cal_range:
             line1.append(f"Active {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C")
         else:
             line1.append("Active")
     else:
-        line1.append("Off")
+        if tc.temp_range:
+            line1.append(f"Off {tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C")
+        else:
+            line1.append("Off")
 
     if tc.current_temp_c is not None:
         line1.append(f"{tc.current_temp_c:.1f}C")
@@ -182,7 +185,7 @@ def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
     if tc.correlation is not None:
         line1.append(f"R2={tc.correlation:.4f}")
 
-    # Line 2: collection stats and data range
+    # Line 2: collection stats
     if tc.sample_count > 0:
         dur = tc.collection_duration_s
         if dur >= 3600:
@@ -192,11 +195,6 @@ def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
         else:
             dur_str = f"{dur}s"
         line2.append(f"{tc.sample_count} samples ({dur_str})")
-    else:
-        line2.append("Collecting")
-
-    if tc.temp_range:
-        line2.append(f"data {tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C")
 
     return " | ".join(line1), " | ".join(line2)
 
