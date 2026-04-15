@@ -279,14 +279,26 @@ class TempCompCollector:
         self._fit_time = now
 
     def _is_outlier(self, temp_millideg: float, freq_ppm: float) -> bool:
-        """Check if a sample is an outlier based on the current fit."""
-        if self._fit is None:
+        """Check if a sample is an outlier based on the current fit.
+
+        Only rejects within the fitted temperature range. Outside the range,
+        data is accepted to allow calibration range expansion.
+        """
+        if self._fit is None or self._fit_residual_std <= 0:
             return False  # no fit yet, accept everything
+
+        # Don't reject data outside the fitted temperature range —
+        # the fit can't predict well there, and we need that data
+        if len(self._temps) > 0:
+            fit_min = min(self._temps)
+            fit_max = max(self._temps)
+            if temp_millideg < fit_min or temp_millideg > fit_max:
+                return False
+
         T0, k0, k1, k2 = self._fit
         predicted = k0 + k1 * (temp_millideg - T0) + k2 * (temp_millideg - T0) ** 2
         residual = abs(freq_ppm - predicted)
-        # Reject if residual > 3σ (99.7% of good data passes)
-        return residual > 3.0 * self._fit_residual_std if self._fit_residual_std > 0 else False
+        return residual > 3.0 * self._fit_residual_std
 
     def load(self):
         """Load persistent data and parse chrony.conf. Call once at startup."""
