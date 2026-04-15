@@ -228,7 +228,7 @@ class Display:
         # Main banner
         banner = get_banner_text(status)
         self._addstr_centered(row, banner, curses.A_BOLD)
-        row += 1
+        row += 2
 
         # Accuracy section
         row = self._render_section(row, w, "Accuracy", format_accuracy_line(status))
@@ -363,17 +363,15 @@ class Display:
                     line += "▒"
             self._addstr(row, label_width + 1, line)
 
+    LABEL_WIDTH = 10  # right-align labels to this width
+    CONTENT_COL = 15  # content starts at this column (after "Label >>> ")
+
     def _render_section(self, row: int, w: int, label: str, content: str,
                         content_attr: int = 0) -> int:
-        """Render a section with a thin divider label and content line."""
-        # Divider: "── Label ──────────────────"
-        pad = w - len(label) - 6  # 4 for leading "── " and trailing " ─"
-        if pad < 2:
-            pad = 2
-        divider = f"\u2500\u2500 {label} " + "\u2500" * pad
-        self._addstr(row, 1, divider[:w - 2], curses.A_DIM)
-        row += 1
-        self._addstr_centered(row, content, content_attr)
+        """Render a section as: 'Label >>>  content' on one line."""
+        prefix = f"{label:>{self.LABEL_WIDTH}} \u00bb  "
+        self._addstr(row, 1, prefix, curses.A_DIM)
+        self._addstr(row, 2 + len(prefix), content, content_attr)
         row += 1
         return row
 
