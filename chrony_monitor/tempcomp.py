@@ -286,7 +286,12 @@ class TempCompCollector:
 
         status.config = self._config
         status.sample_count = len(self._temps)
-        status.collection_duration_s = int(time.time() - self._start_time) if self._start_time else 0
+        if len(self._timestamps) >= 2:
+            status.collection_duration_s = int(self._timestamps[-1] - self._timestamps[0])
+        elif self._start_time:
+            status.collection_duration_s = int(time.time() - self._start_time)
+        else:
+            status.collection_duration_s = 0
 
         if len(self._temps) > 0:
             min_t = min(self._temps) / 1000.0
