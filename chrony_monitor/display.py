@@ -100,26 +100,53 @@ def format_offset(offset_ms: Optional[float]) -> str:
     return f"{offset_ms / 1000:.2f}s"
 
 
-def format_confidence_lines(status: ChronyStatus) -> tuple:
-    """Format time confidence as two lines: accuracy metrics + system info."""
-    line1_parts = []
-    line2_parts = []
+def format_accuracy_line(status: ChronyStatus) -> str:
+    """Format accuracy metrics: StdDev, RMS, Skew."""
+    parts = []
     if status.tracking:
         t = status.tracking
         if status.selected_source and status.selected_source.std_dev > 0:
-            line1_parts.append(f"StdDev {format_us(status.selected_source.std_dev * 1000)}")
+            parts.append(f"StdDev {format_us(status.selected_source.std_dev * 1000)}")
         else:
-            line1_parts.append(f"Bound ±{format_us(t.root_dispersion_us)}")
-        line1_parts.append(f"RMS {format_us(t.rms_offset_us)}")
-        line1_parts.append(f"Freq {t.frequency_ppm:.3f}ppm")
-        line1_parts.append(f"Skew {t.skew_ppm:.3f}ppm")
-        line2_parts.append(f"Poll {t.update_interval:.0f}s")
-        line2_parts.append(f"Stratum {t.stratum}")
-    if line1_parts:
-        return " | ".join(line1_parts), " | ".join(line2_parts)
+            parts.append(f"Bound ±{format_us(t.root_dispersion_us)}")
+        parts.append(f"RMS {format_us(t.rms_offset_us)}")
+        parts.append(f"Skew {t.skew_ppm:.3f}ppm")
+    if parts:
+        return " | ".join(parts)
     if status.error_message:
-        return status.error_message, ""
-    return "No tracking data", ""
+        return status.error_message
+    return "No tracking data"
+
+
+def format_clock_line(status: ChronyStatus) -> str:
+    """Format clock health: Freq, Poll, Stratum."""
+    parts = []
+    if status.tracking:
+        t = status.tracking
+        parts.append(f"Freq {t.frequency_ppm:.3f}ppm")
+        parts.append(f"Poll {t.update_interval:.0f}s")
+        parts.append(f"Stratum {t.stratum}")
+    return " | ".join(parts)
+
+
+def format_source_line(status: ChronyStatus) -> str:
+    """Format source info with GPS if available."""
+    parts = []
+    if status.selected_source:
+        src = status.selected_source
+        parts.append(src.name)
+        parts.append(f"Reach {src.reach}")
+        parts.append(f"LastRx {src.last_rx}")
+    if status.gps:
+        g = status.gps
+        parts.append(f"Sats {g.satellites_used}/{g.satellites_visible}")
+        if g.tdop > 0:
+            parts.append(f"TDOP {g.tdop:.2f}")
+    if parts:
+        return " | ".join(parts)
+    if status.error_message:
+        return status.error_message
+    return "No source selected"
 
 
 def format_us(us: float) -> str:
@@ -133,45 +160,18 @@ def format_us(us: float) -> str:
     return f"{us / 1000000:.2f}s"
 
 
-def format_gps_line(status: ChronyStatus) -> str:
-    """Format GPS satellite info line."""
-    if not status.gps:
-        return ""
-    g = status.gps
-    parts = [f"Sats {g.satellites_used}/{g.satellites_visible}"]
-    if g.tdop > 0:
-        parts.append(f"TDOP {g.tdop:.2f}")
-    return " | ".join(parts)
-
-
-def format_source_info(status: ChronyStatus) -> str:
-    """Format source information line."""
-    if status.selected_source:
-        src = status.selected_source
-        return f"Source: {src.name} | Reach {src.reach} | LastRx {src.last_rx}"
-    if status.error_message:
-        return status.error_message
-    return "No source selected"
-
-
 def format_tempcomp_line(tc: TempCompStatus) -> str:
     """Format temperature compensation status line."""
     parts = []
 
-    # State: calibrated/extrapolating/off
+    # State
     if tc.config and tc.config.is_active:
         if tc.is_extrapolating:
-            cal_range = ""
-            if tc.temp_range:
-                cal_range = f"{tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C"
-            parts.append(f"TempComp: OUTSIDE CAL ({tc.current_temp_c:.0f}C > {cal_range})")
+            parts.append(f"OUTSIDE CAL ({tc.current_temp_c:.0f}C)")
         else:
-            if tc.temp_range:
-                parts.append(f"TempComp: cal {tc.temp_range[0]:.0f}-{tc.temp_range[1]:.0f}C")
-            else:
-                parts.append("TempComp: active")
+            parts.append("Active")
     else:
-        parts.append("TempComp: off")
+        parts.append("Off")
 
     # Current temperature and range
     if tc.current_temp_c is not None:
@@ -228,39 +228,27 @@ class Display:
         # Main banner
         banner = get_banner_text(status)
         self._addstr_centered(row, banner, curses.A_BOLD)
-        row += 2
-
-        # Confidence lines
-        conf_line1, conf_line2 = format_confidence_lines(status)
-        self._addstr_centered(row, conf_line1)
-        row += 1
-        if conf_line2:
-            self._addstr_centered(row, conf_line2, curses.A_DIM)
-            row += 1
-
-        # Source info line
-        info = format_source_info(status)
-        self._addstr_centered(row, info, curses.A_DIM)
         row += 1
 
-        # GPS satellite info
-        gps_line = format_gps_line(status)
-        if gps_line:
-            self._addstr_centered(row, gps_line, curses.A_DIM)
-            row += 1
+        # Accuracy section
+        row = self._render_section(row, w, "Accuracy", format_accuracy_line(status))
 
-        # Tempcomp status
+        # Clock section
+        row = self._render_section(row, w, "Clock", format_clock_line(status))
+
+        # Source section
+        row = self._render_section(row, w, "Source", format_source_line(status))
+
+        # TempComp section
         if tempcomp_status is not None:
             tc_line = format_tempcomp_line(tempcomp_status)
             tc_attr = curses.A_DIM
             if tempcomp_status.is_extrapolating:
                 tc_attr = curses.color_pair(Color.YELLOW)
-            self._addstr_centered(row, tc_line, tc_attr)
-            row += 1
+            row = self._render_section(row, w, "TempComp", tc_line, tc_attr)
 
         # Lock lost timer (if applicable)
         if lock_lost_seconds is not None and lock_lost_seconds > 0:
-            row += 1
             timer_info = f"Lock lost for: {lock_lost_seconds}s"
             if status.sync_state == SyncState.RECOVERING:
                 timer_info += " [AUTO-RECOVERY]"
@@ -374,6 +362,20 @@ class Display:
                 else:
                     line += "▒"
             self._addstr(row, label_width + 1, line)
+
+    def _render_section(self, row: int, w: int, label: str, content: str,
+                        content_attr: int = 0) -> int:
+        """Render a section with a thin divider label and content line."""
+        # Divider: "── Label ──────────────────"
+        pad = w - len(label) - 6  # 4 for leading "── " and trailing " ─"
+        if pad < 2:
+            pad = 2
+        divider = f"\u2500\u2500 {label} " + "\u2500" * pad
+        self._addstr(row, 1, divider[:w - 2], curses.A_DIM)
+        row += 1
+        self._addstr_centered(row, content, content_attr)
+        row += 1
+        return row
 
     def _addstr_centered(self, row: int, text: str, attr: int = 0):
         """Add string centered on screen."""
