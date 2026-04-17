@@ -214,8 +214,7 @@ class Display:
         recovery_logs: Optional[list] = None,
         rms_history: Optional[list] = None,
         rms_duration: int = 0,
-        tempcomp_status: Optional[TempCompStatus] = None,
-        converging: bool = False
+        tempcomp_status: Optional[TempCompStatus] = None
     ):
         """Render the display with current status."""
         color = get_color_for_status(status)
@@ -227,8 +226,6 @@ class Display:
 
         # Main banner
         banner = get_banner_text(status)
-        if converging:
-            banner += " - CONVERGING"
         self._addstr_centered(row, banner, curses.A_BOLD)
         row += 2
 

@@ -9,7 +9,7 @@ from typing import Optional
 from .status import get_status, get_gps_info, SyncState
 from .display import Display
 from .recovery import RecoveryManager, RecoveryConfig
-from .tempcomp import TempCompCollector, read_temperature, _compute_compensation
+from .tempcomp import TempCompCollector, read_temperature
 
 
 @dataclass
@@ -96,16 +96,9 @@ class Monitor:
 
             # Record tempcomp data
             tempcomp_status = None
-            converging = False
             if self.tempcomp and status.tracking:
                 temp = read_temperature(self.tempcomp.sensor_path)
                 if temp is not None and status.tracking.frequency_ppm != 0:
-                    # Reconstruct raw freq for outlier check
-                    raw_freq = status.tracking.frequency_ppm
-                    if self.tempcomp._config and self.tempcomp._config.is_active:
-                        raw_freq += _compute_compensation(
-                            self.tempcomp._config, temp)
-                    converging = self.tempcomp._is_outlier(temp, raw_freq)
                     self.tempcomp.record(temp, status.tracking.frequency_ppm)
                 tempcomp_status = self.tempcomp.get_status()
 
@@ -129,8 +122,7 @@ class Monitor:
                 recovery_logs=self.recovery_manager.get_recent_logs(),
                 rms_history=rms_combined,
                 rms_duration=rms_duration,
-                tempcomp_status=tempcomp_status,
-                converging=converging
+                tempcomp_status=tempcomp_status
             )
 
             time.sleep(self.config.interval)
