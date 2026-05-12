@@ -3,8 +3,22 @@
 # Initialize PPS on serial port DCD pin
 # Scans serial ports with real UARTs, prefers ports with active PPS pulses.
 #
+# Exits 0 with no chrony snippet when no PPS hardware is present, so chrony
+# can run on SHM + NTP only without flapping. Writes the chrony PPS refclock
+# into /etc/chrony/conf.d/gps-pps.conf only after real hardware is confirmed.
+#
 
 set -e
+
+CHRONY_SNIPPET=/etc/chrony/conf.d/gps-pps.conf
+
+# Remove all artifacts that imply "PPS is active" — used when we exit without
+# detecting PPS hardware (no GPS plugged in, or device removed).
+cleanup_no_hardware() {
+    rm -f "$CHRONY_SNIPPET"
+    rm -f /dev/serial-pps
+    rm -f /var/run/pps-serial-port /var/run/ldattach.pid /var/run/pps-device
+}
 
 # Clean up any leftover ldattach from previous runs
 pkill ldattach 2>/dev/null || true
@@ -25,8 +39,9 @@ for PORT in /dev/ttyUSB*; do
 done
 
 if [ -z "$PORTS" ]; then
-    echo "No serial ports found"
-    exit 1
+    echo "No serial ports with real UARTs found — no PPS hardware available"
+    cleanup_no_hardware
+    exit 0
 fi
 
 echo "Scanning ports:$PORTS"
@@ -91,8 +106,9 @@ if [ -z "$BEST_PORT" ] && [ -n "$FALLBACK_PORT" ]; then
 fi
 
 if [ -z "$BEST_PORT" ]; then
-    echo "No PPS-capable serial port found"
-    exit 1
+    echo "No PPS-capable serial port found — chrony will run on SHM + NTP only"
+    cleanup_no_hardware
+    exit 0
 fi
 
 # Kill all ldattach except the one for our chosen port
@@ -105,6 +121,15 @@ echo "Using PPS device $BEST_PPS on $BEST_PORT (DCD pin)"
 
 # Create stable symlink for chrony
 ln -sf "$BEST_PPS" /dev/serial-pps
+
+# Write the chrony PPS refclock snippet now that hardware is confirmed.
+# The :clear option uses the DCD deassert edge, which corresponds to the true
+# second boundary when PPS passes through a MAX232 RS-232 driver.
+mkdir -p "$(dirname "$CHRONY_SNIPPET")"
+cat > "$CHRONY_SNIPPET" << EOF
+# PPS signal from serial port DCD pin (written by init-serial-pps.sh)
+refclock PPS /dev/serial-pps:clear poll 4 refid GPPS lock GPS prefer
+EOF
 
 BEST_PID=$(pgrep -f "ldattach 18 $BEST_PORT" 2>/dev/null || echo "unknown")
 echo "$BEST_PORT" > /var/run/pps-serial-port

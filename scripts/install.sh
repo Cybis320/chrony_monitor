@@ -67,7 +67,7 @@ install_dependencies() {
     info "Checking system dependencies..."
 
     PACKAGES_NEEDED=""
-    for pkg in gpsd gpsd-clients pps-tools chrony; do
+    for pkg in gpsd gpsd-clients pps-tools chrony setserial; do
         if ! dpkg -s "$pkg" &>/dev/null; then
             PACKAGES_NEEDED="$PACKAGES_NEEDED $pkg"
         fi
@@ -172,15 +172,17 @@ configure_chrony() {
 
     if is_raspberry_pi; then
         # GPIO PPS on Raspberry Pi — use /dev/gps-pps symlink (created by udev rule)
-        # No :clear flag needed since GPIO PPS signal is not inverted
-        PPS_REFCLOCK="refclock PPS /dev/gps-pps poll 4 refid GPPS lock GPS prefer"
-        PPS_COMMENT="# PPS signal from GPIO pin (Raspberry Pi pps-gpio overlay)"
+        # No :clear flag needed since GPIO PPS signal is not inverted.
+        # Written directly into the main config since the pps-gpio overlay
+        # provides /dev/gps-pps reliably at kernel load time.
+        PPS_BLOCK="# PPS signal from GPIO pin (Raspberry Pi pps-gpio overlay)
+refclock PPS /dev/gps-pps poll 4 refid GPPS lock GPS prefer"
     else
-        # Serial PPS on Ubuntu/x86 — use /dev/serial-pps symlink
-        # The :clear option uses the DCD deassert edge, which corresponds to the
-        # true second boundary when PPS passes through a MAX232 RS-232 driver
-        PPS_REFCLOCK="refclock PPS /dev/serial-pps:clear poll 4 refid GPPS lock GPS prefer"
-        PPS_COMMENT="# PPS signal from serial port DCD pin"
+        # Serial PPS on Ubuntu/x86 — the refclock line lives in
+        # /etc/chrony/conf.d/gps-pps.conf, written by init-serial-pps.sh only
+        # after PPS hardware is confirmed. Keeps chrony from flapping when no
+        # GPS is plugged in.
+        PPS_BLOCK=""
     fi
 
     cat > /etc/chrony/chrony.conf << EOF
@@ -191,8 +193,7 @@ confdir /etc/chrony/conf.d
 # This provides the coarse time and second labels
 refclock SHM 0 delay 0.2 offset 0.0 poll 4 refid GPS
 
-${PPS_COMMENT}
-${PPS_REFCLOCK}
+${PPS_BLOCK}
 
 # Network time servers as fallback
 pool pool.ntp.org iburst maxsources 4
@@ -541,6 +542,9 @@ cleanup_serial_pps() {
     # Remove stale symlink and runtime files
     rm -f /dev/serial-pps
     rm -f /var/run/pps-serial-port /var/run/ldattach.pid /var/run/pps-device
+
+    # Remove chrony PPS snippet written by serial-pps init script
+    rm -f /etc/chrony/conf.d/gps-pps.conf
 
     # Kill any leftover ldattach processes
     pkill ldattach 2>/dev/null || true
