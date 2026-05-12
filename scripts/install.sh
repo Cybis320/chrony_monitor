@@ -305,25 +305,29 @@ setup_serial_pps() {
     fi
 
     # Configure chrony service dependencies
-    # NOTE: intentionally does not list gpsd.service to avoid circular dependency
+    # NOTE: intentionally does not list gpsd.service to avoid circular dependency.
+    # We only order after serial-pps; we do NOT Want it, so chrony does not
+    # block multi-user.target (and therefore GNOME session startup) while the
+    # PPS scan runs. If serial-pps writes the snippet later, gps-hotplug.service
+    # restarts chrony to pick it up.
     mkdir -p /etc/systemd/system/chrony.service.d/
     cat > /etc/systemd/system/chrony.service.d/gps-pps.conf << 'EOF'
 [Unit]
 After=network.target serial-pps.service
-Wants=serial-pps.service
 
 [Service]
 ExecStartPre=/bin/sleep 2
 EOF
 
     # Configure gpsd service dependencies
-    # Clear default After=chronyd.service to break circular dependency
+    # Clear default After=chronyd.service to break circular dependency.
+    # As above, order after serial-pps without Wants — keeps it off the
+    # critical boot path on no-GPS machines.
     mkdir -p /etc/systemd/system/gpsd.service.d/
     cat > /etc/systemd/system/gpsd.service.d/serial-pps.conf << 'EOF'
 [Unit]
 After=
 After=network.target serial-pps.service
-Wants=serial-pps.service
 
 [Service]
 ExecStartPre=/bin/sleep 1

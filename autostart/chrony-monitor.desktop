@@ -5,6 +5,7 @@ Exec=python3 -m chrony_monitor
 Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=10
 Icon=utilities-system-monitor
 Comment=Monitor chrony time synchronization
 Categories=System;Monitor;

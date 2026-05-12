@@ -79,7 +79,7 @@ for PORT in $PORTS; do
     echo "  PPS device $PPS_DEV created"
 
     # Check for actual pulses
-    if timeout 3 ppstest "$PPS_DEV" 2>&1 | grep -q "assert"; then
+    if timeout 2 ppstest "$PPS_DEV" 2>&1 | grep -q "assert"; then
         echo "  PPS pulses confirmed — using this port"
         BEST_PORT="$PORT"
         BEST_PPS="$PPS_DEV"
