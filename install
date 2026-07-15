@@ -1,0 +1,68 @@
+#!/bin/bash
+#
+# Chrony Monitor one-line installer.
+#
+#   curl -fsSL https://raw.githubusercontent.com/Cybis320/chrony_monitor/main/install | sudo bash
+#
+# Clones (or updates) the repo into /opt/chrony_monitor, runs the full
+# provisioning installer, and enables the daily auto-updater.
+
+set -euo pipefail
+
+REPO_URL="${CHRONY_MONITOR_REPO:-https://github.com/Cybis320/chrony_monitor}"
+BRANCH="${CHRONY_MONITOR_BRANCH:-main}"
+REPO_DIR="${CHRONY_MONITOR_DIR:-/opt/chrony_monitor}"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+err()  { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+
+if [ "$(id -u)" -ne 0 ]; then
+    err "This installer must run as root. Re-run it as:"
+    err "  curl -fsSL $REPO_URL/raw/$BRANCH/install | sudo bash"
+    exit 1
+fi
+
+# The unprivileged user the monitor will run as (for autostart, dialout, sudoers).
+MONITOR_USER="${CHRONY_MONITOR_USER:-${SUDO_USER:-}}"
+if [ -z "$MONITOR_USER" ] || [ "$MONITOR_USER" = "root" ]; then
+    err "Could not determine the login user. Run via sudo from your normal account,"
+    err "or set CHRONY_MONITOR_USER=<username> before running."
+    exit 1
+fi
+info "Installing for user: $MONITOR_USER"
+
+# Ensure git is available.
+if ! command -v git >/dev/null 2>&1; then
+    info "Installing git..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y git
+    else
+        err "git not found and apt-get unavailable — install git and retry."
+        exit 1
+    fi
+fi
+
+# Clone or update the checkout.
+if [ -d "$REPO_DIR/.git" ]; then
+    info "Updating existing checkout at $REPO_DIR..."
+    git config --system --get-all safe.directory 2>/dev/null | grep -qx "$REPO_DIR" || \
+        git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
+    git -C "$REPO_DIR" fetch --quiet origin "$BRANCH"
+    git -C "$REPO_DIR" reset --hard --quiet "origin/$BRANCH"
+else
+    info "Cloning $REPO_URL -> $REPO_DIR..."
+    mkdir -p "$(dirname "$REPO_DIR")"
+    git clone --quiet --branch "$BRANCH" "$REPO_URL" "$REPO_DIR"
+    git config --system --get-all safe.directory 2>/dev/null | grep -qx "$REPO_DIR" || \
+        git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
+fi
+
+chmod +x "$REPO_DIR"/scripts/*.sh "$REPO_DIR"/install 2>/dev/null || true
+
+# Run the full provisioner. SUDO_USER carries the target user through to it.
+info "Running provisioner..."
+SUDO_USER="$MONITOR_USER" bash "$REPO_DIR/scripts/install.sh"
+
+info "Done. The monitor starts on next login and updates itself daily."

@@ -501,12 +501,16 @@ class TempCompCollector:
             self._log_recal(f"Failed: cannot write proposed: {e}")
             return
 
-        # Find the helper script (installed alongside the package or in scripts/)
+        # Find the helper script. Prefer the root-owned installed copy: the
+        # sudoers NOPASSWD rule authorizes exactly /usr/local/bin/apply-tempcomp.sh,
+        # so `sudo -n` only succeeds for that path. The repo/source copy lives in a
+        # user-writable directory and is both unauthorized and unsafe to run as root,
+        # so it's only a last-resort fallback for dev environments without an install.
         script = None
         for candidate in [
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "apply-tempcomp.sh"),
             "/usr/local/bin/apply-tempcomp.sh",
             os.path.join(self._data_dir, "apply-tempcomp.sh"),
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "apply-tempcomp.sh"),
         ]:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 script = candidate

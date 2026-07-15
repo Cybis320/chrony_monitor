@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Chrony Monitor auto-update
+
+[Timer]
+# Once a day, ~10 min after boot if a run was missed while powered off.
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

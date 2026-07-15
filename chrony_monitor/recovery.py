@@ -23,6 +23,7 @@ class RecoveryConfig:
     timeout_seconds: int = 60       # Seconds before attempting recovery
     cooldown_seconds: int = 300     # Seconds between recovery attempts
     enabled: bool = True
+    log_ttl_seconds: int = 600      # Hide recovery-log entries older than this
 
 
 class RecoveryManager:
@@ -32,13 +33,20 @@ class RecoveryManager:
         self.config = config or RecoveryConfig()
         self.lock_lost_time: datetime = None
         self.last_recovery_attempt: datetime = None
-        self.logs: List[str] = []
+        # Each entry is (timestamp, message) so stale logs can be aged out of the display.
+        self.logs: List[Tuple[datetime, str]] = []
         self.is_recovering: bool = False
+
+    def _log(self, message: str):
+        """Append a timestamped recovery-log entry."""
+        self.logs.append((datetime.now(), message))
+        if len(self.logs) > 50:
+            self.logs = self.logs[-50:]
 
     def reset(self):
         """Reset recovery state when lock is restored."""
         if self.lock_lost_time is not None:
-            self.logs.append(f"Lock restored at {datetime.now().strftime('%H:%M:%S')}")
+            self._log(f"Lock restored at {datetime.now().strftime('%H:%M:%S')}")
         self.lock_lost_time = None
         self.is_recovering = False
 
@@ -46,7 +54,7 @@ class RecoveryManager:
         """Called when lock is first lost."""
         if self.lock_lost_time is None:
             self.lock_lost_time = datetime.now()
-            self.logs = [f"Lock lost at {self.lock_lost_time.strftime('%H:%M:%S')}"]
+            self.logs = [(self.lock_lost_time, f"Lock lost at {self.lock_lost_time.strftime('%H:%M:%S')}")]
 
     def get_lock_lost_seconds(self) -> int:
         """Get seconds since lock was lost."""
@@ -88,11 +96,13 @@ class RecoveryManager:
         try:
             success, recovery_logs = self._do_recovery()
             logs.extend(recovery_logs)
-            self.logs.extend(logs)
+            for msg in logs:
+                self._log(msg)
             return success, logs
         except Exception as e:
             logs.append(f"Recovery error: {str(e)}")
-            self.logs.extend(logs)
+            for msg in logs:
+                self._log(msg)
             return False, logs
 
     def _get_sudo_prefix(self) -> List[str]:
@@ -290,5 +300,15 @@ class RecoveryManager:
         return False, logs
 
     def get_recent_logs(self, count: int = 5) -> List[str]:
-        """Get most recent log entries."""
-        return self.logs[-count:] if self.logs else []
+        """Get recent log messages, dropping entries older than the TTL.
+
+        Aging out stale entries keeps the display from showing old
+        "Lock lost / restored" events long after the system has recovered.
+        """
+        if not self.logs:
+            return []
+        now = datetime.now()
+        ttl = self.config.log_ttl_seconds
+        fresh = [msg for ts, msg in self.logs
+                 if (now - ts).total_seconds() <= ttl]
+        return fresh[-count:]

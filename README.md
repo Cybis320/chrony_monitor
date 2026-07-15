@@ -20,24 +20,34 @@ A visual monitor for chrony time synchronization with automatic GPS PPS detectio
 
 ## Installation
 
-### Quick Install (User Mode)
+### One-line install (recommended)
 
 ```bash
-cd chrony_monitor
-pip install -e .
+curl -fsSL https://raw.githubusercontent.com/Cybis320/chrony_monitor/main/install | sudo bash
 ```
 
-### Full Install (Root, with GPS PPS support)
+This clones the repo to `/opt/chrony_monitor`, runs the full provisioner, and
+enables a daily auto-updater. Run it from your normal user account (via `sudo`)
+so the monitor is set up for the right login user. The single `sudo` password
+prompt covers the whole install.
+
+The monitor keeps itself current: a daily systemd timer pulls the latest code,
+and the running monitor re-execs into it automatically — no manual updates. It
+never rewrites `chrony.conf`, so live tempcomp calibration is preserved.
+
+### Manual full install (from a checkout)
 
 ```bash
 sudo ./scripts/install.sh
 ```
 
-This installs:
-- Python package
+Both paths install:
+- Python package (runs directly from the git checkout)
 - Systemd services for PPS initialization
 - Udev rules for GPS/PPS devices
 - Desktop launcher and autostart (launches on login)
+- Passwordless sudo for service recovery and tempcomp recalibration
+- Daily auto-updater (`chrony-monitor-update.timer`)
 
 ## Usage
 

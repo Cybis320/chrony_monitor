@@ -9,7 +9,19 @@
 
 set -euo pipefail
 
-CHRONY_CONF="/etc/chrony/chrony.conf"
+# Locate chrony.conf (Debian/Ubuntu use /etc/chrony/chrony.conf; others /etc/chrony.conf)
+CHRONY_CONF=""
+for c in /etc/chrony/chrony.conf /etc/chrony.conf; do
+    if [ -f "$c" ]; then
+        CHRONY_CONF="$c"
+        break
+    fi
+done
+if [ -z "$CHRONY_CONF" ]; then
+    echo "Error: chrony.conf not found" >&2
+    exit 1
+fi
+
 PROPOSED="$1"
 
 if [ ! -f "$PROPOSED" ]; then

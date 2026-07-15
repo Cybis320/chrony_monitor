@@ -1,6 +1,9 @@
 """Main monitor loop for chrony sync monitoring."""
 
 import curses
+import os
+import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -10,6 +13,25 @@ from .status import get_status, get_gps_info, SyncState
 from .display import Display
 from .recovery import RecoveryManager, RecoveryConfig
 from .tempcomp import TempCompCollector, read_temperature
+
+
+def _repo_dir() -> str:
+    """Directory of the git checkout this package runs from."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _current_head(repo_dir: str) -> Optional[str]:
+    """Return the current git commit of the checkout, or None if not a repo."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_dir, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
 
 
 @dataclass
@@ -23,6 +45,8 @@ class MonitorConfig:
     tempcomp_enabled: bool = True   # Enable tempcomp monitoring
     tempcomp_sensor: str = "/sys/class/thermal/thermal_zone0/temp"
     tempcomp_auto_recal: bool = True  # Enable auto-recalibration
+    self_update: bool = True        # Re-exec when the git checkout is updated
+    self_update_interval: int = 300  # Seconds between update checks
 
 
 class Monitor:
@@ -46,6 +70,11 @@ class Monitor:
         self._rms_minute_count = 0
         self._last_good_status = None
         self._error_count = 0
+        # Self-update: remember the commit we started on; re-exec if it moves.
+        self._repo_dir = _repo_dir()
+        self._start_head = _current_head(self._repo_dir) if self.config.self_update else None
+        self._last_update_check = time.time()
+        self._restart_requested = False
         self.tempcomp = None
         if self.config.tempcomp_enabled:
             self.tempcomp = TempCompCollector(
@@ -125,7 +154,24 @@ class Monitor:
                 tempcomp_status=tempcomp_status
             )
 
+            # Pick up code updates pulled by the background updater by re-exec'ing.
+            if self._check_for_update():
+                self._restart_requested = True
+                self.running = False
+                break
+
             time.sleep(self.config.interval)
+
+    def _check_for_update(self) -> bool:
+        """Return True if the git checkout has moved past our start commit."""
+        if not self.config.self_update or self._start_head is None:
+            return False
+        now = time.time()
+        if now - self._last_update_check < self.config.self_update_interval:
+            return False
+        self._last_update_check = now
+        head = _current_head(self._repo_dir)
+        return head is not None and head != self._start_head
 
     def _handle_recovery(self, status):
         """Handle recovery state machine."""
@@ -149,9 +195,17 @@ class Monitor:
 def run_monitor(config: MonitorConfig = None):
     """Run the monitor with curses wrapper."""
     monitor = Monitor(config)
+    restart = False
     try:
         curses.wrapper(monitor.run)
+        restart = monitor._restart_requested
     except KeyboardInterrupt:
         pass
     finally:
         print("\nMonitor stopped.")
+
+    # curses.wrapper has restored the terminal by now — safe to re-exec into
+    # the freshly pulled code, keeping the same terminal/session and args.
+    if restart:
+        print("Update detected — restarting monitor...")
+        os.execv(sys.executable, [sys.executable, "-m", "chrony_monitor"] + sys.argv[1:])

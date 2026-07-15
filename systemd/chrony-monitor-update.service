@@ -1,0 +1,9 @@
+[Unit]
+Description=Chrony Monitor auto-update (pull latest code and refresh helpers)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/chrony_monitor/scripts/update.sh
+# Updater runs as root: it writes to /usr/local/bin, /etc/systemd, /etc/sudoers.d

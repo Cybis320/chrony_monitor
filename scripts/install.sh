@@ -558,6 +558,45 @@ cleanup_serial_pps() {
     info "Serial-PPS cleanup complete."
 }
 
+# Install the daily auto-updater (systemd timer + service)
+install_updater() {
+    info "Installing auto-updater..."
+
+    # Only meaningful for a git checkout we can pull.
+    if [ ! -d "$PROJECT_DIR/.git" ]; then
+        warn "Not a git checkout ($PROJECT_DIR) — skipping auto-updater"
+        return
+    fi
+
+    local repo_url monitor_user
+    repo_url="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
+    monitor_user="${SUDO_USER:-root}"
+
+    # Let both root (updater) and the monitor user run git in the root-owned checkout.
+    if ! git config --system --get-all safe.directory 2>/dev/null | grep -qx "$PROJECT_DIR"; then
+        git config --system --add safe.directory "$PROJECT_DIR" 2>/dev/null || true
+    fi
+
+    # Record where the updater should pull and who the monitor runs as.
+    mkdir -p /etc/chrony-monitor
+    cat > /etc/chrony-monitor/update.env << ENVEOF
+REPO_DIR=$PROJECT_DIR
+REPO_URL=$repo_url
+MONITOR_USER=$monitor_user
+ENVEOF
+    chmod 644 /etc/chrony-monitor/update.env
+
+    chmod +x "$PROJECT_DIR"/scripts/*.sh 2>/dev/null || true
+    install -m 0644 -o root -g root \
+        "$PROJECT_DIR/systemd/chrony-monitor-update.service" /etc/systemd/system/
+    install -m 0644 -o root -g root \
+        "$PROJECT_DIR/systemd/chrony-monitor-update.timer" /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --now chrony-monitor-update.timer 2>/dev/null || \
+        warn "Could not enable chrony-monitor-update.timer"
+    info "Auto-updater installed (daily). Manual run: sudo systemctl start chrony-monitor-update.service"
+}
+
 # Main installation
 main() {
     echo "========================================"
@@ -573,6 +612,7 @@ main() {
     configure_chrony
     setup_gps_pps
     install_desktop_file
+    install_updater
     start_services
     validate_hardware
     print_usage
