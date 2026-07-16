@@ -52,6 +52,7 @@ class TempCompStatus:
     is_extrapolating: bool = False
     cal_range: Optional[tuple] = None       # (min_C, max_C) from calibration
     last_recal: Optional[str] = None        # human-readable last recalibration
+    warning: Optional[str] = None           # e.g. sensor appears stuck
 
 
 def read_temperature(sensor_path: str) -> Optional[float]:
@@ -61,6 +62,62 @@ def read_temperature(sensor_path: str) -> Optional[float]:
             return float(f.read().strip())
     except (OSError, ValueError):
         return None
+
+
+THERMAL_BASE = "/sys/class/thermal"
+DEFAULT_SENSOR = "/sys/class/thermal/thermal_zone0/temp"
+
+# Suitability ranking for crystal tempcomp; lower number = better. We want a
+# sensor that tracks board/ambient temperature (what the clock crystal sees),
+# is not stuck at a constant, and is not dominated by CPU load.
+_SENSOR_TYPE_PRIORITY = [
+    (re.compile(r'pch', re.I),             10),  # Intel PCH (chipset) — best proxy for board temp
+    (re.compile(r'cpu[-_]?thermal', re.I), 20),  # Raspberry Pi / ARM SoC — the right sensor there
+    (re.compile(r'bcm2835', re.I),         20),  # Raspberry Pi thermal
+    (re.compile(r'soc[-_]?thermal', re.I), 25),
+    (re.compile(r'x86_pkg_temp', re.I),    40),  # CPU package — noisy (load), fallback only
+    (re.compile(r'coretemp', re.I),        45),
+    (re.compile(r'acpitz', re.I),          90),  # frequently stuck constant on Intel — last resort
+]
+
+
+def _read_zone_type(zone_dir: str) -> str:
+    """Read a thermal zone's `type` string (e.g. 'pch_cometlake'), or ''."""
+    try:
+        with open(os.path.join(zone_dir, "type")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def detect_temp_sensor(default: str = DEFAULT_SENSOR) -> str:
+    """Pick the best tempcomp sensor for this machine by thermal-zone type.
+
+    Prefers the chipset (PCH) on Intel and the SoC sensor on ARM/Pi; demotes
+    acpitz (frequently stuck at a constant value) and CPU-package sensors
+    (noisy, driven by CPU load). Falls back to `default` if nothing readable
+    is found. An explicit sensor path always takes precedence over this.
+    """
+    best, best_prio = None, None
+    try:
+        zones = sorted(d for d in os.listdir(THERMAL_BASE)
+                       if d.startswith("thermal_zone"))
+    except OSError:
+        return default
+    for z in zones:
+        zone_dir = os.path.join(THERMAL_BASE, z)
+        path = os.path.join(zone_dir, "temp")
+        if read_temperature(path) is None:
+            continue
+        ztype = _read_zone_type(zone_dir)
+        prio = 100  # unknown but readable type: usable, low priority
+        for rx, p in _SENSOR_TYPE_PRIORITY:
+            if rx.search(ztype):
+                prio = p
+                break
+        if best_prio is None or prio < best_prio:
+            best, best_prio = path, prio
+    return best or default
 
 
 def parse_chrony_tempcomp(conf_paths=None) -> Optional[TempCompConfig]:
@@ -222,8 +279,12 @@ def _filter_outliers(temps: list, freqs: list) -> tuple:
 class TempCompCollector:
     """Collects temperature/frequency data for tempcomp calibration."""
 
-    def __init__(self, sensor_path: str = "/sys/class/thermal/thermal_zone0/temp",
+    def __init__(self, sensor_path: str = None,
                  data_dir: str = None, auto_recal: bool = True):
+        # sensor_path=None (the default) means auto-detect the best sensor for
+        # this machine. An explicit path is honored as-is.
+        if sensor_path is None:
+            sensor_path = detect_temp_sensor()
         self.sensor_path = sensor_path
         self.auto_recal = auto_recal
         if data_dir is None:
@@ -233,6 +294,7 @@ class TempCompCollector:
         self._data_dir = data_dir
         self._csv_path = os.path.join(data_dir, "tempcomp.csv")
         self._recal_log_path = os.path.join(data_dir, "recalibrations.log")
+        self._sensor_meta_path = os.path.join(data_dir, "sensor")
 
         self._temps = deque(maxlen=MAX_SAMPLES)
         self._freqs = deque(maxlen=MAX_SAMPLES)
@@ -304,10 +366,56 @@ class TempCompCollector:
         """Load persistent data and parse chrony.conf. Call once at startup."""
         self._start_time = time.time()
         self._config = parse_chrony_tempcomp()
+        self._invalidate_data_if_sensor_changed()
         self._load_csv()
         self._load_recal_time()
         self._load_cal_range()
         self._update_fit()  # build initial fit from loaded data
+
+    def _invalidate_data_if_sensor_changed(self):
+        """Discard collected data if it was gathered with a different sensor.
+
+        Temperatures recorded against one sensor are meaningless for another
+        (e.g. a station upgrading from a stuck acpitz reading to the PCH
+        sensor), and mixing them corrupts every fit. If the persisted sensor
+        differs from the current one -- or no sensor was recorded but a CSV
+        exists (a pre-upgrade install of unknown provenance) -- archive the
+        CSV and reset calibration so collection starts clean.
+        """
+        prev = None
+        try:
+            with open(self._sensor_meta_path) as f:
+                prev = f.read().strip()
+        except OSError:
+            pass
+
+        has_csv = os.path.exists(self._csv_path)
+        stale = (prev is not None and prev != self.sensor_path) or \
+                (prev is None and has_csv)
+
+        if stale:
+            try:
+                if has_csv:
+                    os.replace(self._csv_path, self._csv_path + ".old")
+            except OSError:
+                pass
+            for p in (self._cal_range_path, self._recal_log_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            self._cal_range = None
+            self._last_recal_time = 0
+            log.info("tempcomp: sensor changed (%s -> %s); archived old data",
+                     prev, self.sensor_path)
+
+        # Record the sensor now in use for the next startup.
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(self._sensor_meta_path, 'w') as f:
+                f.write(self.sensor_path + '\n')
+        except OSError:
+            pass
 
     def record(self, temp_millideg: float, frequency_ppm: float):
         """Record a (temp, freq) pair. Called every 1s from the monitor loop.
@@ -379,6 +487,15 @@ class TempCompCollector:
             status.temp_range = (min_t, max_t)
 
             temp_range_c = max_t - min_t
+
+            # Stuck-sensor guard: plenty of samples and clearly-varying
+            # frequency, yet the temperature never moves -> the sensor is
+            # almost certainly reporting a constant (e.g. a broken acpitz).
+            if (len(self._temps) >= MIN_SAMPLES_CORRELATION
+                    and temp_range_c < 0.5):
+                freq_span = max(self._freqs) - min(self._freqs)
+                if freq_span > 0.1:
+                    status.warning = "sensor stuck? (no temp variation)"
             if (len(self._temps) >= MIN_SAMPLES_CORRELATION
                     and temp_range_c >= MIN_TEMP_RANGE_CORRELATION):
                 now = time.time()

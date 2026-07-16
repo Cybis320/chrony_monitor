@@ -185,6 +185,9 @@ def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
     if tc.correlation is not None:
         line1.append(f"R2={tc.correlation:.4f}")
 
+    if tc.warning:
+        line1.append(tc.warning)
+
     # Line 2: collection stats
     if tc.sample_count > 0:
         dur = tc.collection_duration_s

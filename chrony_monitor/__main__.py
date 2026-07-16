@@ -87,9 +87,10 @@ Colors:
     parser.add_argument(
         "--tempcomp-sensor",
         type=str,
-        default="/sys/class/thermal/thermal_zone0/temp",
+        default=None,
         metavar="PATH",
-        help="Temperature sensor sysfs path (default: /sys/class/thermal/thermal_zone0/temp)"
+        help="Temperature sensor sysfs path "
+             "(default: auto-detect; prefers the chipset/PCH sensor)"
     )
 
     parser.add_argument(
