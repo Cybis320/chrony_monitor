@@ -77,7 +77,10 @@ _SENSOR_TYPE_PRIORITY = [
     (re.compile(r'soc[-_]?thermal', re.I), 25),
     (re.compile(r'x86_pkg_temp', re.I),    40),  # CPU package — noisy (load), fallback only
     (re.compile(r'coretemp', re.I),        45),
-    (re.compile(r'acpitz', re.I),          90),  # frequently stuck constant on Intel — last resort
+    # acpitz is frequently stuck at a constant on Intel, but it is at least a
+    # board-level sensor: still preferred over an unrecognized zone, which is as
+    # likely to be wifi/NVMe/battery as anything tracking the crystal.
+    (re.compile(r'acpitz', re.I),          90),
 ]
 
 
@@ -388,19 +391,31 @@ class TempCompCollector:
         self._load_cal_range()
         self._update_fit()  # build initial fit from loaded data
 
+    def _config_matches_sensor(self) -> bool:
+        """True if chrony.conf's tempcomp uses the sensor we collect against.
+
+        When it doesn't, its T0/k coefficients live in a different temperature
+        scale and cannot be compared with, or reused alongside, our own.
+        """
+        if not self._config:
+            return False
+        return sensor_identity(self._config.sensor_path) == \
+            sensor_identity(self.sensor_path)
+
     def _invalidate_data_if_sensor_changed(self):
         """Discard collected data if it was gathered with a different sensor.
 
         Temperatures recorded against one sensor are meaningless for another
         (e.g. a station upgrading from a stuck acpitz reading to the PCH
-        sensor), and mixing them corrupts every fit. If the persisted sensor
-        differs from the current one -- or no sensor was recorded but a CSV
-        exists (a pre-upgrade install of unknown provenance) -- archive the
-        CSV and reset calibration so collection starts clean.
+        sensor), and mixing them corrupts every fit. If the sensor in use
+        differs from the one the data was gathered with, archive the CSV and
+        reset calibration so collection starts clean.
 
         Identity is keyed on the sensor *type* rather than its path, so a
         thermal-zone renumber across a kernel update (same physical sensor,
-        new index) does not needlessly discard good data.
+        new index) does not needlessly discard good data. Where no sensor was
+        recorded at all the old hardcoded default is assumed, which is what any
+        pre-upgrade CSV was necessarily collected against.
         """
         cur = sensor_identity(self.sensor_path)
         prev = None
@@ -410,9 +425,22 @@ class TempCompCollector:
         except OSError:
             pass
 
+        if prev and not prev.startswith(("type:", "path:")):
+            # Written by the first version of this check, which stored a bare
+            # path. Resolve it to an identity so an unchanged sensor is
+            # recognized. (If the zone renumbered since, the type at that index
+            # is now someone else's and we correctly treat it as a change.)
+            prev = sensor_identity(prev)
+
         has_csv = os.path.exists(self._csv_path)
-        stale = (prev is not None and prev != cur) or \
-                (prev is None and has_csv)
+        if prev is None and has_csv:
+            # Pre-upgrade install: no sensor was recorded, but the CSV can only
+            # have been collected against the old hardcoded default, so key off
+            # that rather than discarding it as unknown provenance. On ARM/Pi
+            # auto-detect picks that same zone, so those stations keep their data.
+            prev = sensor_identity(DEFAULT_SENSOR)
+
+        stale = prev is not None and prev != cur
 
         if stale:
             try:
@@ -448,7 +476,18 @@ class TempCompCollector:
         # Reconstruct raw frequency if tempcomp is active
         raw_freq = frequency_ppm
         if self._config and self._config.is_active:
-            raw_freq = frequency_ppm + _compute_compensation(self._config, temp_millideg)
+            # chrony's compensation is a function of *its* sensor, which may not
+            # be the one we collect against (e.g. right after auto-detect moves
+            # off a stuck acpitz while chrony.conf still names the old zone).
+            # Evaluating the polynomial at our temperature would inject a
+            # spurious temperature-dependent term with the old k1 slope.
+            comp_temp = temp_millideg
+            if not self._config_matches_sensor():
+                comp_temp = read_temperature(self._config.sensor_path)
+            # If chrony's sensor is unreadable, chrony isn't compensating
+            # either, so the measured frequency is already the raw one.
+            if comp_temp is not None:
+                raw_freq = frequency_ppm + _compute_compensation(self._config, comp_temp)
 
         self._minute_temps.append(temp_millideg)
         self._minute_freqs.append(raw_freq)
@@ -589,7 +628,7 @@ class TempCompCollector:
             if abs(comp) > 10.0:
                 return  # coefficients would be rejected by chrony
 
-        if self._config and self._config.is_active:
+        if self._config and self._config.is_active and self._config_matches_sensor():
             # Compare residual slope: current vs proposed
             # Simulate what the residual frequency would be with each compensation
             current_residuals = []
@@ -610,7 +649,10 @@ class TempCompCollector:
             if improvement < MIN_IMPROVEMENT:
                 return
         else:
-            # No active tempcomp — check if quadratic fit explains enough variance
+            # No active tempcomp, or one keyed to a sensor we're not collecting
+            # against (its coefficients aren't comparable to ours, so there is
+            # nothing meaningful to improve on) — check instead that the
+            # quadratic fit explains enough variance
             predicted = [new_k0 + new_k1 * (t - new_T0) + new_k2 * (t - new_T0) ** 2
                          for t in temps_md]
             ss_res = sum((f - p) ** 2 for f, p in zip(freqs, predicted))
@@ -744,6 +786,11 @@ class TempCompCollector:
         if self._cal_range:
             return self._cal_range
         if not self._config:
+            return None
+        if not self._config_matches_sensor():
+            # T0 is in the other sensor's scale, so a range derived from it says
+            # nothing about the temperatures we read. Better no range than a
+            # wrong one that would flag a bogus OUTSIDE.
             return None
         # Fallback: estimate ±10°C around T0
         T0_c = self._config.T0 / 1000.0

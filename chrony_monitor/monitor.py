@@ -43,7 +43,7 @@ class MonitorConfig:
     recovery_timeout: int = 60      # Seconds before recovery attempt
     recovery_cooldown: int = 300    # Seconds between recovery attempts
     tempcomp_enabled: bool = True   # Enable tempcomp monitoring
-    tempcomp_sensor: str = None     # None = auto-detect best sensor for this machine
+    tempcomp_sensor: Optional[str] = None  # None = auto-detect best sensor for this machine
     tempcomp_auto_recal: bool = True  # Enable auto-recalibration
     self_update: bool = True        # Re-exec when the git checkout is updated
     self_update_interval: int = 300  # Seconds between update checks
