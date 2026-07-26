@@ -36,13 +36,18 @@ git -C "$REPO_DIR" reset --hard --quiet "origin/$BRANCH"
 NEW="$(git -C "$REPO_DIR" rev-parse HEAD)"
 
 if [ "$OLD" = "$NEW" ]; then
-    log "Already up to date ($NEW)"
-    exit 0
+    log "Already up to date ($NEW) — verifying runtime artifacts"
+else
+    log "Updated $OLD -> $NEW on $BRANCH"
 fi
-
-log "Updated $OLD -> $NEW on $BRANCH"
 chmod +x "$REPO_DIR"/scripts/*.sh "$REPO_DIR"/install 2>/dev/null || true
 
+# Deliberately do NOT exit early when OLD==NEW. CHANGED is then empty, so the
+# change-gated refreshes below no-op — but their idempotent "install if missing"
+# fail-safes and the migration still run. This lets a station that pulled new
+# code through an OLDER update.sh (which never had these blocks) self-heal on a
+# later tick instead of being stuck with the code present but its runtime pieces
+# (resolver lib, sensor service, chrony.conf migration) never installed.
 CHANGED="$(git -C "$REPO_DIR" diff --name-only "$OLD" "$NEW")"
 changed() { echo "$CHANGED" | grep -qx "$1"; }
 changed_under() { echo "$CHANGED" | grep -q "^$1"; }
@@ -123,4 +128,8 @@ if changed "scripts/install.sh"; then
     log "NOTE: install.sh changed; a manual re-provision may be warranted (it rewrites chrony.conf)"
 fi
 
-log "Update applied; running monitor will re-exec into the new code shortly"
+if [ "$OLD" != "$NEW" ]; then
+    log "Update applied; running monitor will re-exec into the new code shortly"
+else
+    log "Runtime artifacts verified"
+fi
