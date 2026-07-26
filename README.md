@@ -48,6 +48,18 @@ Both paths install:
 - Desktop launcher and autostart (launches on login)
 - Passwordless sudo for service recovery and tempcomp recalibration
 - Daily auto-updater (`chrony-monitor-update.timer`)
+- Stable tempcomp sensor symlink service (`chrony-tempcomp-sensor.service`)
+
+### Stable temperature sensor
+
+`/sys/class/thermal/thermal_zoneN` indices are **not stable** — a kernel update
+can renumber them, so a raw zone path baked into `chrony.conf` silently starts
+reading the wrong sensor after a reboot. To avoid this, `chrony-tempcomp-sensor.service`
+runs at boot (before chrony), detects the best sensor *by type* (chipset/PCH on
+Intel, the SoC sensor on Pi), and points a fixed symlink
+`/run/chrony-monitor/tempcomp-sensor` at the correct zone. `chrony.conf` and the
+auto-recalibrator reference that symlink instead of a zone number. Existing
+installs are migrated automatically on update (`migrate-tempcomp-sensor.sh`).
 
 ## Usage
 

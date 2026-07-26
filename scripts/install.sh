@@ -597,6 +597,24 @@ ENVEOF
     info "Auto-updater installed (daily). Manual run: sudo systemctl start chrony-monitor-update.service"
 }
 
+# Install the stable tempcomp sensor symlink resolver + boot service.
+# Keeps chrony.conf's tempcomp sensor valid across thermal-zone renumbering.
+install_tempcomp_sensor_service() {
+    info "Installing stable tempcomp sensor service..."
+    install -m 0755 -o root -g root \
+        "$PROJECT_DIR/scripts/update-tempcomp-symlink.sh" /usr/local/bin/update-tempcomp-symlink.sh
+    install -m 0644 -o root -g root \
+        "$PROJECT_DIR/systemd/chrony-tempcomp-sensor.service" /etc/systemd/system/chrony-tempcomp-sensor.service
+    systemctl daemon-reload
+    systemctl enable chrony-tempcomp-sensor.service 2>/dev/null || \
+        warn "Could not enable chrony-tempcomp-sensor.service"
+    systemctl start chrony-tempcomp-sensor.service 2>/dev/null || \
+        warn "Could not start chrony-tempcomp-sensor.service"
+    # Repoint any pre-existing raw thermal_zone tempcomp path to the symlink.
+    bash "$PROJECT_DIR/scripts/migrate-tempcomp-sensor.sh" || \
+        warn "tempcomp sensor migration skipped"
+}
+
 # Main installation
 main() {
     echo "========================================"
@@ -613,6 +631,7 @@ main() {
     setup_gps_pps
     install_desktop_file
     install_updater
+    install_tempcomp_sensor_service
     start_services
     validate_hardware
     print_usage

@@ -72,6 +72,16 @@ def read_temperature(sensor_path: str) -> Optional[float]:
 THERMAL_BASE = "/sys/class/thermal"
 DEFAULT_SENSOR = "/sys/class/thermal/thermal_zone0/temp"
 
+# Stable, reboot-proof alias for the tempcomp sensor. Thermal-zone indices
+# renumber across kernel updates, so a raw thermal_zoneN path baked into
+# chrony.conf (or written by _apply_calibration) silently starts pointing at
+# the wrong sensor. A boot-time service (chrony-tempcomp-sensor.service) runs
+# detect_temp_sensor() and repoints this symlink at the right zone every boot;
+# chrony.conf and the calibration writer reference the symlink instead of a
+# zone number. Absent (e.g. service not installed), callers fall back to the
+# concrete path.
+STABLE_SENSOR_LINK = "/run/chrony-monitor/tempcomp-sensor"
+
 # Suitability ranking for crystal tempcomp; lower number = better. We want a
 # sensor that tracks board/ambient temperature (what the clock crystal sees),
 # is not stuck at a constant, and is not dominated by CPU load.
@@ -143,15 +153,33 @@ def sensor_identity(sensor_path: str) -> str:
     """Return a reboot-stable identity for a sensor.
 
     Thermal-zone indices renumber across kernel updates, so the *path* is not a
-    reliable key for "is this the same physical sensor". When the path is a
+    reliable key for "is this the same physical sensor". When the path (or, for
+    the stable STABLE_SENSOR_LINK alias, its symlink target) is a
     thermal_zoneN/temp node, key on its `type` (e.g. 'pch_cometlake') instead,
     which follows the hardware. Otherwise fall back to the path.
+
+    Only the alias's own link is resolved — not os.path.realpath, which would
+    also chase the /sys/class/thermal/thermal_zoneN class symlink down into
+    /sys/devices and defeat the zone-number match.
     """
-    m = re.match(r'(/sys/class/thermal/thermal_zone\d+)/temp$', sensor_path or "")
-    if m:
-        ztype = _read_zone_type(m.group(1))
-        if ztype:
-            return "type:" + ztype
+    candidates = []
+    if sensor_path:
+        candidates.append(sensor_path)
+        try:
+            if os.path.islink(sensor_path):
+                tgt = os.readlink(sensor_path)
+                if not os.path.isabs(tgt):
+                    tgt = os.path.normpath(
+                        os.path.join(os.path.dirname(sensor_path), tgt))
+                candidates.append(tgt)
+        except OSError:
+            pass
+    for cand in candidates:
+        m = re.match(r'(/sys/class/thermal/thermal_zone\d+)/temp$', cand)
+        if m:
+            ztype = _read_zone_type(m.group(1))
+            if ztype:
+                return "type:" + ztype
     return "path:" + (sensor_path or "")
 
 
@@ -708,7 +736,10 @@ class TempCompCollector:
     def _apply_calibration(self, T0: float, k0: float, k1: float, k2: float):
         """Write proposed tempcomp and apply via the helper script."""
         self._last_attempt_time = time.time()
-        sensor = self.sensor_path
+        # Prefer the reboot-stable symlink so the directive survives thermal-zone
+        # renumbering; fall back to the concrete path if the symlink service
+        # isn't installed (its target resolves to the same sensor we detected).
+        sensor = STABLE_SENSOR_LINK if os.path.exists(STABLE_SENSOR_LINK) else self.sensor_path
         new_line = f"tempcomp {sensor} 30 {T0:.0f} {k0:.6f} {k1:.10f} {k2:.12f}"
 
         # Write proposed config to staging file
@@ -904,3 +935,10 @@ class TempCompCollector:
             os.replace(tmp_path, self._csv_path)
         except OSError:
             pass
+
+
+if __name__ == "__main__":
+    # Print the auto-detected sensor path — the single source of truth used by
+    # the boot-time symlink service (update-tempcomp-symlink.sh) to point
+    # STABLE_SENSOR_LINK at the right thermal zone for this machine.
+    print(detect_temp_sensor())

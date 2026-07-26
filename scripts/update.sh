@@ -69,6 +69,24 @@ if changed "systemd/serial-pps.service"; then
     RELOAD=1
 fi
 
+# Install/refresh the stable tempcomp sensor resolver + boot service, and
+# migrate any raw thermal_zone path in chrony.conf onto the stable symlink.
+if changed "scripts/update-tempcomp-symlink.sh" || changed "systemd/chrony-tempcomp-sensor.service"; then
+    log "tempcomp sensor service changed — reinstalling"
+    install -m 0755 -o root -g root \
+        "$REPO_DIR/scripts/update-tempcomp-symlink.sh" /usr/local/bin/update-tempcomp-symlink.sh || true
+    install -m 0644 -o root -g root \
+        "$REPO_DIR/systemd/chrony-tempcomp-sensor.service" /etc/systemd/system/chrony-tempcomp-sensor.service || true
+    systemctl daemon-reload
+    systemctl enable chrony-tempcomp-sensor.service 2>/dev/null || true
+    systemctl start chrony-tempcomp-sensor.service 2>/dev/null || true
+    RELOAD=1
+fi
+# Idempotent: repoints a stale raw-zone tempcomp path once, no-ops thereafter.
+if [ -x /usr/local/bin/update-tempcomp-symlink.sh ] && [ -f "$REPO_DIR/scripts/migrate-tempcomp-sensor.sh" ]; then
+    bash "$REPO_DIR/scripts/migrate-tempcomp-sensor.sh" || log "tempcomp sensor migration skipped"
+fi
+
 # Self-update the updater's own units/script.
 if changed "systemd/chrony-monitor-update.service" || changed "systemd/chrony-monitor-update.timer"; then
     log "Updater units changed — reinstalling"

@@ -1,0 +1,18 @@
+[Unit]
+Description=Publish a stable symlink to the chrony tempcomp temperature sensor
+Documentation=https://github.com/Cybis320/chrony_monitor
+# The symlink lives on tmpfs (/run) and must exist before chrony reads its
+# tempcomp file. Ordered before both the Debian (chrony) and upstream (chronyd)
+# unit names.
+After=local-fs.target
+Before=chrony.service chronyd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/update-tempcomp-symlink.sh /run/chrony-monitor/tempcomp-sensor
+
+[Install]
+# Pulled in whenever chrony starts (so a `systemctl restart chrony` also
+# refreshes the link), plus at normal boot.
+WantedBy=chrony.service chronyd.service multi-user.target
