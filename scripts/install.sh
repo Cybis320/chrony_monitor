@@ -597,10 +597,27 @@ ENVEOF
     info "Auto-updater installed (daily). Manual run: sudo systemctl start chrony-monitor-update.service"
 }
 
+# Install a root-owned copy of the Python package for the boot-time sensor
+# resolver. The git checkout is user-writable, so importing from it in a service
+# that runs as root would hand a local user code execution as root — the same
+# reason apply-tempcomp.sh is only authorized at its /usr/local/bin path.
+# Keeping one implementation (rather than a second ranking in shell) is why the
+# resolver imports the real module at all.
+install_resolver_lib() {
+    local lib=/usr/local/lib/chrony-monitor
+    rm -rf "$lib/chrony_monitor"
+    install -d -m 0755 -o root -g root "$lib" "$lib/chrony_monitor"
+    install -m 0644 -o root -g root \
+        "$PROJECT_DIR"/chrony_monitor/*.py "$lib/chrony_monitor/"
+}
+
 # Install the stable tempcomp sensor symlink resolver + boot service.
 # Keeps chrony.conf's tempcomp sensor valid across thermal-zone renumbering.
 install_tempcomp_sensor_service() {
     info "Installing stable tempcomp sensor service..."
+    # Root-owned copy of the package for the boot resolver. It runs as root
+    # before chrony, so it must not import from the user-writable git checkout.
+    install_resolver_lib
     install -m 0755 -o root -g root \
         "$PROJECT_DIR/scripts/update-tempcomp-symlink.sh" /usr/local/bin/update-tempcomp-symlink.sh
     install -m 0644 -o root -g root \

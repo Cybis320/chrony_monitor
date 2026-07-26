@@ -45,6 +45,7 @@ chmod +x "$REPO_DIR"/scripts/*.sh "$REPO_DIR"/install 2>/dev/null || true
 
 CHANGED="$(git -C "$REPO_DIR" diff --name-only "$OLD" "$NEW")"
 changed() { echo "$CHANGED" | grep -qx "$1"; }
+changed_under() { echo "$CHANGED" | grep -q "^$1"; }
 
 # Refresh the tempcomp helper + sudoers rule only if the helper changed.
 if changed "scripts/apply-tempcomp.sh"; then
@@ -69,9 +70,23 @@ if changed "systemd/serial-pps.service"; then
     RELOAD=1
 fi
 
+# Refresh the root-owned copy of the package that the boot resolver imports.
+# Must track every chrony_monitor/*.py change, not just tempcomp.py, so the
+# resolver never imports a half-updated package.
+RESOLVER_LIB=/usr/local/lib/chrony-monitor
+if changed_under "chrony_monitor/" || [ ! -d "$RESOLVER_LIB/chrony_monitor" ]; then
+    log "refreshing root-owned resolver library"
+    rm -rf "$RESOLVER_LIB/chrony_monitor"
+    install -d -m 0755 -o root -g root "$RESOLVER_LIB" "$RESOLVER_LIB/chrony_monitor" || true
+    install -m 0644 -o root -g root \
+        "$REPO_DIR"/chrony_monitor/*.py "$RESOLVER_LIB/chrony_monitor/" || true
+fi
+
 # Install/refresh the stable tempcomp sensor resolver + boot service, and
 # migrate any raw thermal_zone path in chrony.conf onto the stable symlink.
-if changed "scripts/update-tempcomp-symlink.sh" || changed "systemd/chrony-tempcomp-sensor.service"; then
+if changed "scripts/update-tempcomp-symlink.sh" \
+   || changed "systemd/chrony-tempcomp-sensor.service" \
+   || [ ! -x /usr/local/bin/update-tempcomp-symlink.sh ]; then
     log "tempcomp sensor service changed — reinstalling"
     install -m 0755 -o root -g root \
         "$REPO_DIR/scripts/update-tempcomp-symlink.sh" /usr/local/bin/update-tempcomp-symlink.sh || true

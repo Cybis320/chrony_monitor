@@ -2,17 +2,23 @@
 Description=Publish a stable symlink to the chrony tempcomp temperature sensor
 Documentation=https://github.com/Cybis320/chrony_monitor
 # The symlink lives on tmpfs (/run) and must exist before chrony reads its
-# tempcomp file. Ordered before both the Debian (chrony) and upstream (chronyd)
-# unit names.
+# tempcomp file. Ubuntu names the daemon's unit chrony.service; chronyd.service
+# is listed too so this also works against an upstream-style install.
 After=local-fs.target
 Before=chrony.service chronyd.service
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
+# Deliberately NOT RemainAfterExit=yes. A oneshot that stays "active (exited)"
+# already satisfies the Wants below, so systemd would skip it on a chrony
+# restart -- exactly when we want the link re-resolved. Staying inactive after
+# exit means every chrony start re-runs it, which also retries a boot where the
+# thermal driver hadn't loaded yet.
 ExecStart=/usr/local/bin/update-tempcomp-symlink.sh /run/chrony-monitor/tempcomp-sensor
+# The resolver waits up to 15s for a real board/SoC zone to appear.
+TimeoutStartSec=60
 
 [Install]
-# Pulled in whenever chrony starts (so a `systemctl restart chrony` also
-# refreshes the link), plus at normal boot.
+# Pulled in whenever chrony starts (so `systemctl restart chrony` refreshes the
+# link), plus at normal boot.
 WantedBy=chrony.service chronyd.service multi-user.target

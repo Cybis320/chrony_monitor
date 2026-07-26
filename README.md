@@ -57,9 +57,28 @@ can renumber them, so a raw zone path baked into `chrony.conf` silently starts
 reading the wrong sensor after a reboot. To avoid this, `chrony-tempcomp-sensor.service`
 runs at boot (before chrony), detects the best sensor *by type* (chipset/PCH on
 Intel, the SoC sensor on Pi), and points a fixed symlink
-`/run/chrony-monitor/tempcomp-sensor` at the correct zone. `chrony.conf` and the
-auto-recalibrator reference that symlink instead of a zone number. Existing
-installs are migrated automatically on update (`migrate-tempcomp-sensor.sh`).
+`/run/chrony-monitor/tempcomp-sensor` at the correct zone. `chrony.conf`, the
+monitor and the auto-recalibrator all reference that symlink instead of a zone
+number. Existing installs are migrated automatically on update
+(`migrate-tempcomp-sensor.sh`).
+
+Because thermal drivers are loaded by udev, the right zone may not exist the
+instant the service runs, so it waits up to 15s for a real board/SoC sensor
+before settling for `acpitz`. If no usable sensor is found it leaves the symlink
+alone and fails, and the migration refuses to repoint `chrony.conf` at a link
+that isn't published — a stale sensor beats a missing one.
+
+To see what it picked, or to check a machine by hand:
+
+```bash
+readlink /run/chrony-monitor/tempcomp-sensor
+sudo PYTHONPATH=/usr/local/lib/chrony-monitor \
+    python3 -m chrony_monitor.tempcomp --verbose
+```
+
+The resolver imports a root-owned copy of the package at
+`/usr/local/lib/chrony-monitor`, refreshed by `install.sh` and `update.sh`, so a
+root service at boot never executes code from the user-writable git checkout.
 
 ## Usage
 

@@ -5,6 +5,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -106,6 +107,15 @@ _SENSOR_TYPE_PRIORITY = [
 # on unpopulated zones, and negatives on ones that report an error in-band.
 SENSOR_PLAUSIBLE_RANGE_C = (5.0, 110.0)
 
+# Priorities at or below this are real board/SoC sensors; above it we're into
+# acpitz and unrecognized zones, which we accept only because nothing better
+# exists. The boot-time resolver waits a moment for one of these to appear:
+# intel_pch_thermal is a module loaded by udev, so at the point the resolver
+# runs the PCH zone may not exist yet even though it will seconds later.
+# (On a Pi the SoC sensor is built in and present immediately.)
+PREFERRED_PRIORITY = 45
+UNKNOWN_ZONE_PRIORITY = 100
+
 
 def _read_zone_type(zone_dir: str) -> str:
     """Read a thermal zone's `type` string (e.g. 'pch_cometlake'), or ''."""
@@ -116,21 +126,21 @@ def _read_zone_type(zone_dir: str) -> str:
         return ""
 
 
-def detect_temp_sensor(default: str = DEFAULT_SENSOR) -> str:
-    """Pick the best tempcomp sensor for this machine by thermal-zone type.
+def rank_temp_sensors() -> list:
+    """Rank readable thermal zones for tempcomp use.
 
-    Prefers the chipset (PCH) on Intel and the SoC sensor on ARM/Pi; demotes
-    acpitz (frequently stuck at a constant value) and CPU-package sensors
-    (noisy, driven by CPU load). Zones reporting an implausible temperature are
-    skipped outright. Falls back to `default` if nothing usable is found. An
-    explicit sensor path always takes precedence over this.
+    Returns [(priority, path), ...] best first. Zones reporting an implausible
+    temperature are omitted entirely; the rest are scored by `type`, so the
+    chipset (PCH) wins on Intel and the SoC sensor on ARM/Pi, while acpitz
+    (frequently stuck at a constant), CPU-package sensors (noisy, driven by
+    load), and non-board zones (wifi, NVMe, the INT3400 virtual zone) sink.
     """
-    best, best_prio = None, None
+    ranked = []
     try:
         zones = sorted(d for d in os.listdir(THERMAL_BASE)
                        if d.startswith("thermal_zone"))
     except OSError:
-        return default
+        return ranked
     lo, hi = SENSOR_PLAUSIBLE_RANGE_C
     for z in zones:
         zone_dir = os.path.join(THERMAL_BASE, z)
@@ -139,14 +149,38 @@ def detect_temp_sensor(default: str = DEFAULT_SENSOR) -> str:
         if millideg is None or not (lo <= millideg / 1000.0 <= hi):
             continue
         ztype = _read_zone_type(zone_dir)
-        prio = 100  # unknown but readable type: usable, low priority
+        prio = UNKNOWN_ZONE_PRIORITY  # readable but unrecognized: usable, last
         for rx, p in _SENSOR_TYPE_PRIORITY:
             if rx.search(ztype):
                 prio = p
                 break
-        if best_prio is None or prio < best_prio:
-            best, best_prio = path, prio
-    return best or default
+        ranked.append((prio, path))
+    ranked.sort(key=lambda pp: pp[0])
+    return ranked
+
+
+def detect_temp_sensor(default: str = DEFAULT_SENSOR) -> str:
+    """Pick the best tempcomp sensor for this machine by thermal-zone type.
+
+    Falls back to `default` if nothing usable is found. An explicit sensor path
+    always takes precedence over this. See rank_temp_sensors() for the ranking.
+    """
+    ranked = rank_temp_sensors()
+    return ranked[0][1] if ranked else default
+
+
+def preferred_sensor_path() -> str:
+    """The sensor the monitor should read: the stable alias when it's usable.
+
+    Reading through STABLE_SENSOR_LINK keeps the monitor, chrony.conf and the
+    persisted sensor identity all naming the same thing by construction rather
+    than by coincidence -- sensor_identity() resolves the link to its zone type,
+    so the identity is unchanged either way. Falls back to detecting a concrete
+    zone when the boot service isn't installed or its link is unusable.
+    """
+    if read_temperature(STABLE_SENSOR_LINK) is not None:
+        return STABLE_SENSOR_LINK
+    return detect_temp_sensor()
 
 
 def sensor_identity(sensor_path: str) -> str:
@@ -344,10 +378,10 @@ class TempCompCollector:
 
     def __init__(self, sensor_path: str = None,
                  data_dir: str = None, auto_recal: bool = True):
-        # sensor_path=None (the default) means auto-detect the best sensor for
-        # this machine. An explicit path is honored as-is.
+        # sensor_path=None (the default) means use the stable alias, or detect a
+        # concrete zone if it isn't published. An explicit path is honored as-is.
         if sensor_path is None:
-            sensor_path = detect_temp_sensor()
+            sensor_path = preferred_sensor_path()
         self.sensor_path = sensor_path
         self.auto_recal = auto_recal
         if data_dir is None:
@@ -738,8 +772,12 @@ class TempCompCollector:
         self._last_attempt_time = time.time()
         # Prefer the reboot-stable symlink so the directive survives thermal-zone
         # renumbering; fall back to the concrete path if the symlink service
-        # isn't installed (its target resolves to the same sensor we detected).
-        sensor = STABLE_SENSOR_LINK if os.path.exists(STABLE_SENSOR_LINK) else self.sensor_path
+        # isn't installed. Gate on being able to *read* it, not just on it
+        # existing: writing a sensor chrony can't read silently disables
+        # compensation, which is the failure this whole mechanism exists to stop.
+        sensor = self.sensor_path
+        if read_temperature(STABLE_SENSOR_LINK) is not None:
+            sensor = STABLE_SENSOR_LINK
         new_line = f"tempcomp {sensor} 30 {T0:.0f} {k0:.6f} {k1:.10f} {k2:.12f}"
 
         # Write proposed config to staging file
@@ -937,8 +975,53 @@ class TempCompCollector:
             pass
 
 
+def _cli(argv=None) -> int:
+    """Print the sensor to point STABLE_SENSOR_LINK at, or fail if there is none.
+
+    This is the single source of truth for the boot-time symlink service
+    (update-tempcomp-symlink.sh), which runs it as root from a root-owned copy of
+    the package. Exits non-zero when no usable zone exists, so the caller can
+    refuse to publish a link rather than publishing a wrong one.
+    """
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="python3 -m chrony_monitor.tempcomp",
+        description="Print the best temperature sensor for tempcomp.")
+    p.add_argument(
+        "--wait-preferred", type=float, default=0.0, metavar="SECONDS",
+        help="Wait up to SECONDS for a real board/SoC sensor to appear before "
+             "settling for acpitz or an unrecognized zone. Thermal drivers are "
+             "loaded by udev, so at boot the good zone may not exist yet.")
+    p.add_argument("--verbose", action="store_true",
+                   help="Report the full ranking on stderr.")
+    args = p.parse_args(argv)
+
+    deadline = time.monotonic() + max(0.0, args.wait_preferred)
+    while True:
+        ranked = rank_temp_sensors()
+        if args.verbose:
+            for prio, path in ranked:
+                print(f"{prio:4d}  {path}  "
+                      f"({_read_zone_type(os.path.dirname(path)) or 'unknown'})",
+                      file=sys.stderr)
+        if ranked and ranked[0][0] <= PREFERRED_PRIORITY:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+
+    if not ranked:
+        print("no usable thermal zone found", file=sys.stderr)
+        return 1
+    prio, path = ranked[0]
+    if prio > PREFERRED_PRIORITY:
+        print(f"warning: settling for a fallback sensor ({path}, "
+              f"{_read_zone_type(os.path.dirname(path)) or 'unknown'}); no "
+              f"board/SoC zone appeared", file=sys.stderr)
+    print(path)
+    return 0
+
+
 if __name__ == "__main__":
-    # Print the auto-detected sensor path — the single source of truth used by
-    # the boot-time symlink service (update-tempcomp-symlink.sh) to point
-    # STABLE_SENSOR_LINK at the right thermal zone for this machine.
-    print(detect_temp_sensor())
+    sys.exit(_cli())
