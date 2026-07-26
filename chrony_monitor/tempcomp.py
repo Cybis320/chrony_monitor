@@ -120,6 +120,22 @@ def detect_temp_sensor(default: str = DEFAULT_SENSOR) -> str:
     return best or default
 
 
+def sensor_identity(sensor_path: str) -> str:
+    """Return a reboot-stable identity for a sensor.
+
+    Thermal-zone indices renumber across kernel updates, so the *path* is not a
+    reliable key for "is this the same physical sensor". When the path is a
+    thermal_zoneN/temp node, key on its `type` (e.g. 'pch_cometlake') instead,
+    which follows the hardware. Otherwise fall back to the path.
+    """
+    m = re.match(r'(/sys/class/thermal/thermal_zone\d+)/temp$', sensor_path or "")
+    if m:
+        ztype = _read_zone_type(m.group(1))
+        if ztype:
+            return "type:" + ztype
+    return "path:" + (sensor_path or "")
+
+
 def parse_chrony_tempcomp(conf_paths=None) -> Optional[TempCompConfig]:
     """Parse tempcomp directive from chrony.conf.
 
@@ -381,7 +397,12 @@ class TempCompCollector:
         differs from the current one -- or no sensor was recorded but a CSV
         exists (a pre-upgrade install of unknown provenance) -- archive the
         CSV and reset calibration so collection starts clean.
+
+        Identity is keyed on the sensor *type* rather than its path, so a
+        thermal-zone renumber across a kernel update (same physical sensor,
+        new index) does not needlessly discard good data.
         """
+        cur = sensor_identity(self.sensor_path)
         prev = None
         try:
             with open(self._sensor_meta_path) as f:
@@ -390,7 +411,7 @@ class TempCompCollector:
             pass
 
         has_csv = os.path.exists(self._csv_path)
-        stale = (prev is not None and prev != self.sensor_path) or \
+        stale = (prev is not None and prev != cur) or \
                 (prev is None and has_csv)
 
         if stale:
@@ -407,13 +428,13 @@ class TempCompCollector:
             self._cal_range = None
             self._last_recal_time = 0
             log.info("tempcomp: sensor changed (%s -> %s); archived old data",
-                     prev, self.sensor_path)
+                     prev, cur)
 
         # Record the sensor now in use for the next startup.
         try:
             os.makedirs(self._data_dir, exist_ok=True)
             with open(self._sensor_meta_path, 'w') as f:
-                f.write(self.sensor_path + '\n')
+                f.write(cur + '\n')
         except OSError:
             pass
 
