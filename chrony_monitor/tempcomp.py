@@ -21,6 +21,11 @@ MIN_TEMP_RANGE_FIT = 5.0        # °C
 MAX_DATA_DAYS = 30
 MAX_SAMPLES = 43200             # 30 days at 1-min resolution
 
+# Stuck-sensor detection: no temperature movement at all across a fit's worth of
+# samples, while the frequency is visibly drifting.
+STUCK_SENSOR_TEMP_RANGE_C = 0.5
+STUCK_SENSOR_MIN_FREQ_SPAN = 0.1  # ppm
+
 # Auto-recalibration safeguards
 MIN_RECAL_INTERVAL = 86400      # 24 hours between recalibrations
 MIN_IMPROVEMENT = 0.3           # New fit must reduce residual slope by 30%
@@ -81,7 +86,15 @@ _SENSOR_TYPE_PRIORITY = [
     # board-level sensor: still preferred over an unrecognized zone, which is as
     # likely to be wifi/NVMe/battery as anything tracking the crystal.
     (re.compile(r'acpitz', re.I),          90),
+    # Not board/ambient proxies at all — ranked below even an unknown zone.
+    # INT3400 is the ACPI DPTF virtual zone, which typically reports a constant
+    # (often exactly 20.0C, so a plausibility check can't catch it).
+    (re.compile(r'int3400|iwlwifi|nvme|battery|charger', re.I), 120),
 ]
+
+# A readable zone outside this band isn't reporting board temperature: 0 shows up
+# on unpopulated zones, and negatives on ones that report an error in-band.
+SENSOR_PLAUSIBLE_RANGE_C = (5.0, 110.0)
 
 
 def _read_zone_type(zone_dir: str) -> str:
@@ -98,8 +111,9 @@ def detect_temp_sensor(default: str = DEFAULT_SENSOR) -> str:
 
     Prefers the chipset (PCH) on Intel and the SoC sensor on ARM/Pi; demotes
     acpitz (frequently stuck at a constant value) and CPU-package sensors
-    (noisy, driven by CPU load). Falls back to `default` if nothing readable
-    is found. An explicit sensor path always takes precedence over this.
+    (noisy, driven by CPU load). Zones reporting an implausible temperature are
+    skipped outright. Falls back to `default` if nothing usable is found. An
+    explicit sensor path always takes precedence over this.
     """
     best, best_prio = None, None
     try:
@@ -107,10 +121,12 @@ def detect_temp_sensor(default: str = DEFAULT_SENSOR) -> str:
                        if d.startswith("thermal_zone"))
     except OSError:
         return default
+    lo, hi = SENSOR_PLAUSIBLE_RANGE_C
     for z in zones:
         zone_dir = os.path.join(THERMAL_BASE, z)
         path = os.path.join(zone_dir, "temp")
-        if read_temperature(path) is None:
+        millideg = read_temperature(path)
+        if millideg is None or not (lo <= millideg / 1000.0 <= hi):
             continue
         ztype = _read_zone_type(zone_dir)
         prio = 100  # unknown but readable type: usable, low priority
@@ -402,14 +418,35 @@ class TempCompCollector:
         return sensor_identity(self._config.sensor_path) == \
             sensor_identity(self.sensor_path)
 
+    @staticmethod
+    def _archive(path: str, owner: str):
+        """Move `path` aside, tagged with the sensor identity that produced it.
+
+        Tagging rather than a plain '.old' suffix means a second sensor change
+        doesn't destroy the first station's archive.
+        """
+        if not os.path.exists(path):
+            return
+        tag = owner or "unknown"
+        if tag.startswith("type:"):
+            tag = tag[5:]
+        elif tag.startswith("path:"):
+            # e.g. '/sys/class/thermal/thermal_zone7/temp' -> 'thermal_zone7'
+            tag = os.path.basename(os.path.dirname(tag[5:])) or tag[5:]
+        tag = re.sub(r'[^A-Za-z0-9_.-]', '_', tag)[:48] or "unknown"
+        try:
+            os.replace(path, f"{path}.{tag}.old")
+        except OSError:
+            pass
+
     def _invalidate_data_if_sensor_changed(self):
         """Discard collected data if it was gathered with a different sensor.
 
         Temperatures recorded against one sensor are meaningless for another
         (e.g. a station upgrading from a stuck acpitz reading to the PCH
         sensor), and mixing them corrupts every fit. If the sensor in use
-        differs from the one the data was gathered with, archive the CSV and
-        reset calibration so collection starts clean.
+        differs from the one the data was gathered with, archive the CSV and the
+        recalibration log and reset calibration so collection starts clean.
 
         Identity is keyed on the sensor *type* rather than its path, so a
         thermal-zone renumber across a kernel update (same physical sensor,
@@ -443,18 +480,18 @@ class TempCompCollector:
         stale = prev is not None and prev != cur
 
         if stale:
+            # Archive under the sensor that produced them, so a later change (or
+            # a flip back) can't overwrite an earlier station's history. The
+            # calibration range is derived data, so it's simply dropped.
+            self._archive(self._csv_path, prev)
+            self._archive(self._recal_log_path, prev)
             try:
-                if has_csv:
-                    os.replace(self._csv_path, self._csv_path + ".old")
+                os.remove(self._cal_range_path)
             except OSError:
                 pass
-            for p in (self._cal_range_path, self._recal_log_path):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
             self._cal_range = None
             self._last_recal_time = 0
+            self.recal_logs = []
             log.info("tempcomp: sensor changed (%s -> %s); archived old data",
                      prev, cur)
 
@@ -548,13 +585,16 @@ class TempCompCollector:
 
             temp_range_c = max_t - min_t
 
-            # Stuck-sensor guard: plenty of samples and clearly-varying
-            # frequency, yet the temperature never moves -> the sensor is
-            # almost certainly reporting a constant (e.g. a broken acpitz).
-            if (len(self._temps) >= MIN_SAMPLES_CORRELATION
-                    and temp_range_c < 0.5):
+            # Stuck-sensor guard: clearly-varying frequency, yet the temperature
+            # never moves -> the sensor is almost certainly reporting a constant
+            # (e.g. a broken acpitz). Gated on a full fit's worth of samples,
+            # not an hour's: a climate-controlled site really can hold under
+            # half a degree for an hour, and crying wolf on every data reset
+            # would train the warning to be ignored.
+            if (len(self._temps) >= MIN_SAMPLES_FIT
+                    and temp_range_c < STUCK_SENSOR_TEMP_RANGE_C):
                 freq_span = max(self._freqs) - min(self._freqs)
-                if freq_span > 0.1:
+                if freq_span > STUCK_SENSOR_MIN_FREQ_SPAN:
                     status.warning = "sensor stuck? (no temp variation)"
             if (len(self._temps) >= MIN_SAMPLES_CORRELATION
                     and temp_range_c >= MIN_TEMP_RANGE_CORRELATION):
