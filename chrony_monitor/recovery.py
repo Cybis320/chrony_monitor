@@ -1,11 +1,12 @@
 """PPS recovery logic for automatic fault recovery."""
 
+import json
 import os
 import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 def is_raspberry_pi() -> bool:
@@ -18,10 +19,68 @@ def is_raspberry_pi() -> bool:
 
 
 @dataclass
+class GpsFix:
+    """Snapshot of what gpsd reports about the receiver."""
+    reachable: bool = False         # gpsd answered at all
+    mode: int = 0                   # TPV mode: 0/1 = no fix, 2 = 2D, 3 = 3D
+    satellites_used: int = 0
+    satellites_visible: int = 0
+
+    @property
+    def has_fix(self) -> bool:
+        """Receiver has a solution, so it will drive the timepulse."""
+        return self.mode >= 2 and self.satellites_used > 0
+
+    @property
+    def receiver_talking(self) -> bool:
+        """gpsd is parsing sentences from the receiver — the service chain is alive."""
+        return self.reachable and self.satellites_visible > 0
+
+
+def query_gps_fix() -> GpsFix:
+    """
+    Ask gpsd for the current fix state.
+
+    An unreachable gpsd (dead, or gpspipe not installed) yields reachable=False,
+    which callers must treat as "unknown" rather than "no fix".
+    """
+    try:
+        out = subprocess.check_output(
+            ["gpspipe", "-w", "-n", "15"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8
+        )
+    except Exception:
+        return GpsFix()
+
+    fix = GpsFix(reachable=True)
+    for line in out.splitlines():
+        try:
+            msg = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        cls = msg.get('class')
+        # Take the best value seen in the window, so one stale message can't
+        # make a working receiver look dead.
+        if cls == 'TPV':
+            fix.mode = max(fix.mode, int(msg.get('mode', 0)))
+        elif cls == 'SKY':
+            if 'uSat' in msg:
+                fix.satellites_used = max(fix.satellites_used, int(msg['uSat']))
+            if 'nSat' in msg:
+                fix.satellites_visible = max(fix.satellites_visible, int(msg['nSat']))
+
+    return fix
+
+
+@dataclass
 class RecoveryConfig:
     """Configuration for recovery behavior."""
     timeout_seconds: int = 60       # Seconds before attempting recovery
     cooldown_seconds: int = 300     # Seconds between recovery attempts
+    fix_check_seconds: int = 60     # Seconds between gpsd fix checks
     enabled: bool = True
     log_ttl_seconds: int = 600      # Hide recovery-log entries older than this
 
@@ -36,6 +95,10 @@ class RecoveryManager:
         # Each entry is (timestamp, message) so stale logs can be aged out of the display.
         self.logs: List[Tuple[datetime, str]] = []
         self.is_recovering: bool = False
+        self.reception_fault: str = None    # Set while recovery is suppressed
+        self._fix_check_time: datetime = None
+        self._fix_fault: str = None
+        self._fault_logged_time: datetime = None
 
     def _log(self, message: str):
         """Append a timestamped recovery-log entry."""
@@ -49,6 +112,10 @@ class RecoveryManager:
             self._log(f"Lock restored at {datetime.now().strftime('%H:%M:%S')}")
         self.lock_lost_time = None
         self.is_recovering = False
+        self.reception_fault = None
+        self._fix_check_time = None
+        self._fix_fault = None
+        self._fault_logged_time = None
 
     def on_lock_lost(self):
         """Called when lock is first lost."""
@@ -79,7 +146,63 @@ class RecoveryManager:
             if time_since_last < self.config.cooldown_seconds:
                 return False
 
+        # Last gate: don't restart services for a fault restarting can't fix.
+        fault = self._reception_fault()
+        if fault is not None:
+            self._note_reception_fault(fault)
+            self.reception_fault = fault
+            return False
+
+        if self.reception_fault is not None:
+            self._log("GPS fix restored — recovery re-armed")
+            self.reception_fault = None
+            self._fault_logged_time = None
+
         return True
+
+    def _check_reception_fault(self) -> Optional[str]:
+        """
+        Return a reason string when the fault is reception rather than services.
+
+        A receiver that is talking to gpsd but has no fix has a dead antenna or
+        has lost sky view. The timepulse only runs while the receiver is locked,
+        so no amount of restarting brings PPS back — and every restart wipes
+        chrony's NTP fallback reach and tempcomp state, making things worse.
+
+        Returns None when a restart is still worth trying: gpsd unreachable
+        (it may itself be wedged) or a receiver that has a fix but no pulses.
+        """
+        fix = query_gps_fix()
+
+        if not fix.receiver_talking or fix.has_fix:
+            return None
+
+        return (f"GPS has no fix ({fix.satellites_used}/{fix.satellites_visible} "
+                f"sats used) — check antenna; skipping service restart")
+
+    def _reception_fault(self) -> Optional[str]:
+        """Cached _check_reception_fault, so gpsd is polled at most once per interval."""
+        now = datetime.now()
+        if (self._fix_check_time is None
+                or (now - self._fix_check_time).total_seconds() >= self.config.fix_check_seconds):
+            self._fix_check_time = now
+            self._fix_fault = self._check_reception_fault()
+        return self._fix_fault
+
+    def _note_reception_fault(self, fault: str):
+        """
+        Log the suppression reason, refreshing it before it ages out.
+
+        get_recent_logs() drops entries older than log_ttl_seconds, so logging
+        this once would leave the display with no explanation for why recovery
+        sits idle. Re-logging one entry per TTL keeps exactly one fresh line
+        visible without filling the panel with repeats.
+        """
+        now = datetime.now()
+        if (self._fault_logged_time is None
+                or (now - self._fault_logged_time).total_seconds() >= self.config.log_ttl_seconds):
+            self._log(fault)
+            self._fault_logged_time = now
 
     def attempt_recovery(self) -> Tuple[bool, List[str]]:
         """
