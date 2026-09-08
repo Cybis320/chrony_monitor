@@ -13,8 +13,8 @@ A visual monitor for chrony time synchronization with automatic GPS PPS detectio
 
 | Color  | Meaning           | Condition                           |
 |--------|-------------------|-------------------------------------|
-| Green  | Excellent sync    | GPPS locked OR NTP offset < 1ms     |
-| Blue   | Good NTP sync     | NTP synced, offset < 50ms           |
+| Green  | GPS PPS locked    | GPPS is the selected source         |
+| Blue   | NTP synced        | NTP source selected, offset < 50ms  |
 | Yellow | Degraded/Warning  | Recovering, high offset, PPS issue  |
 | Red    | Error             | No sync, daemon down                |
 

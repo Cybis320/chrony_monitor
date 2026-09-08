@@ -23,8 +23,8 @@ Examples:
   %(prog)s --interval 2       Poll every 2 seconds
 
 Colors:
-  Green   - Excellent sync (GPPS locked or NTP <1ms offset)
-  Blue    - Good NTP sync (<50ms offset)
+  Green   - GPS PPS locked
+  Blue    - NTP synced (<50ms offset)
   Yellow  - Degraded, recovering, or PPS issue
   Red     - No sync or daemon error
 """

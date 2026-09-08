@@ -51,10 +51,9 @@ def get_color_for_status(status: ChronyStatus) -> int:
         return Color.YELLOW
 
     if state == SyncState.NTP_SYNCED:
-        # NTP mode - green only for excellent, otherwise blue
-        if quality == SyncQuality.EXCELLENT:
-            return Color.GREEN
-        if quality == SyncQuality.GOOD:
+        # NTP mode is blue however good the offset: green is reserved for a
+        # GPS PPS lock, so a glance across stations tells PPS from NTP apart.
+        if quality in (SyncQuality.EXCELLENT, SyncQuality.GOOD):
             return Color.BLUE
         return Color.YELLOW
 
