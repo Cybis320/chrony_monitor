@@ -786,9 +786,14 @@ class TempCompCollector:
 
     def _check_recalibration(self):
         """Check if recalibration is warranted and apply if so."""
-        # Enforce minimum interval between recalibrations (also covers failed attempts)
+        # Enforce minimum interval between recalibrations (also covers failed
+        # attempts). Include the last *applied* recalibration loaded from the log
+        # at startup, not just attempts made by this process: every apply
+        # restarts chrony, and without this a monitor restart (self-update,
+        # relogin) could re-apply within minutes of the previous one.
         now = time.time()
-        if self._last_attempt_time > 0 and now - self._last_attempt_time < MIN_RECAL_INTERVAL:
+        last = max(self._last_attempt_time, self._last_recal_time)
+        if last > 0 and now - last < MIN_RECAL_INTERVAL:
             return
 
         # Need enough data
