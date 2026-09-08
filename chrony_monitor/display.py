@@ -241,6 +241,12 @@ class Display:
         # Source section
         row = self._render_section(row, w, "Source", format_source_line(status))
 
+        # A machine set up for GPS whose receiver isn't present: say so rather
+        # than showing a quietly healthy NTP screen, but don't chase it with
+        # recovery (see gps_receiver_state).
+        if status.gps_configured and not status.pps_expected and status.gps_reason:
+            row = self._render_section(row, w, "GPS", status.gps_reason, curses.A_DIM)
+
         # TempComp section
         if tempcomp_status is not None:
             tc_line1, tc_line2 = format_tempcomp_lines(tempcomp_status)

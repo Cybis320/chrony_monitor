@@ -6,7 +6,7 @@ import sys
 
 from . import __version__
 from .monitor import MonitorConfig, run_monitor
-from .status import get_status, has_usb_gps, has_pps_device
+from .status import get_status, gps_receiver_state, chrony_has_refclock, has_pps_device
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -110,10 +110,13 @@ def print_status():
     print("=" * 40)
 
     # Hardware detection
-    usb_gps = has_usb_gps()
+    receiver, _configured, reason = gps_receiver_state()
+    refclock = chrony_has_refclock()
     pps_device = has_pps_device()
-    print(f"USB GPS detected:  {'Yes' if usb_gps else 'No'}")
+    print(f"GPS receiver:      {'Yes' if receiver else 'No'} ({reason})")
     print(f"PPS device exists: {'Yes' if pps_device else 'No'}")
+    print(f"chrony refclock:   "
+          f"{'unknown' if refclock is None else 'Yes' if refclock else 'No'}")
     print(f"Expected mode:     {'GPS PPS' if status.pps_expected else 'NTP only'}")
     print()
 

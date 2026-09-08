@@ -80,6 +80,8 @@ class ChronyStatus:
     pps_expected: bool
     tracking: Optional[TrackingInfo] = None
     gps: Optional[GpsInfo] = None
+    gps_configured: bool = False   # machine is set up for a receiver
+    gps_reason: str = ""           # why pps_expected is what it is
 
 
 # Regex to match the selected source line (starts with * after mode char)
@@ -126,28 +128,95 @@ def parse_offset(field: str) -> float:
         return float('inf')
 
 
-def has_usb_gps() -> bool:
-    """Check if a USB GPS device is present."""
-    # Check for common USB GPS device paths
-    gps_patterns = [
-        '/dev/ttyACM*',
-        '/dev/ttyUSB*',
-        '/dev/gps*',
-    ]
-    for pattern in gps_patterns:
-        if glob.glob(pattern):
-            return True
+GPSD_DEFAULTS = "/etc/default/gpsd"
+# Receiver symlinks published by udev: gpsd's own vendor rules and the ttyACM
+# rule install.sh ships both create /dev/gpsN. Deliberately not /dev/gps*, which
+# would also match the /dev/gps-pps GPIO timepulse symlink.
+GPS_DEVICE_GLOBS = ["/dev/gps[0-9]*"]
+CHRONY_CONF_PATHS = ["/etc/chrony/chrony.conf", "/etc/chrony.conf"]
 
-    # Also check if gpsd is configured with a device
+
+def gpsd_configured_devices(defaults_path: str = GPSD_DEFAULTS) -> list:
+    """Device paths gpsd is configured to open (DEVICES= in /etc/default/gpsd).
+
+    Returns [] when the file is missing or DEVICES is empty -- the Debian
+    default, where gpsd relies on udev hotplug instead.
+    """
     try:
-        with open('/etc/default/gpsd', 'r') as f:
-            content = f.read()
-            if '/dev/tty' in content and 'DEVICES=' in content:
-                return True
-    except (FileNotFoundError, PermissionError):
-        pass
+        with open(defaults_path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    devices = []
+    for line in lines:
+        m = re.match(r'^\s*(?:export\s+)?DEVICES\s*=\s*(.*?)\s*$', line)
+        if not m:
+            continue
+        val = m.group(1)
+        if val[:1] in ('"', "'"):
+            val = val[1:].split(val[0], 1)[0]
+        else:
+            val = val.split('#', 1)[0]
+        devices = val.split()  # last assignment wins, as in the shell
+    return devices
 
-    return False
+
+def gps_receiver_state(defaults_path: str = GPSD_DEFAULTS,
+                       device_globs: list = None) -> tuple:
+    """Is a GPS receiver actually present? Returns (present, configured, reason).
+
+    Keyed on the device gpsd is configured to open, not on "some serial gadget
+    exists": a bare /dev/ttyUSB* or /dev/ttyACM* match counts USB-serial
+    adapters, LED flashers and Arduinos as receivers, which put the monitor in
+    GPS mode on machines with no GPS at all -- and then had it restart chrony
+    every cooldown chasing a PPS that could never appear.
+
+    - gpsd has DEVICES set: present iff one of them exists right now. Absent
+      means the receiver is unplugged (or was never attached), and restarting
+      services cannot conjure it.
+    - gpsd has no DEVICES (hotplug mode): present iff udev has published a
+      /dev/gpsN symlink for a recognized receiver.
+
+    `configured` is True whenever the machine is set up for a receiver, so a
+    caller can tell "no GPS here" from "GPS expected but missing".
+    """
+    if device_globs is None:
+        device_globs = GPS_DEVICE_GLOBS
+    devices = gpsd_configured_devices(defaults_path)
+    if devices:
+        present = [d for d in devices if glob.glob(d)]
+        if present:
+            return True, True, f"{present[0]} present"
+        return False, True, f"{' '.join(devices)} not present, receiver unplugged?"
+    for pattern in device_globs:
+        found = sorted(glob.glob(pattern))
+        if found:
+            return True, True, f"{found[0]} present"
+    return False, False, "no receiver configured: DEVICES in /etc/default/gpsd is empty"
+
+
+def has_usb_gps() -> bool:
+    """True when a GPS receiver is present. See gps_receiver_state()."""
+    return gps_receiver_state()[0]
+
+
+def chrony_has_refclock(conf_paths: list = None) -> Optional[bool]:
+    """Does chrony.conf declare a refclock? None if no config could be read.
+
+    GPS/PPS can only ever become a chrony source through a refclock directive,
+    so without one there is nothing for PPS recovery to recover. Unknown (config
+    unreadable) is reported as None so callers can fail open.
+    """
+    for path in conf_paths or CHRONY_CONF_PATHS:
+        try:
+            with open(path) as f:
+                for line in f:
+                    if re.match(r'^\s*refclock\s', line):
+                        return True
+        except OSError:
+            continue
+        return False
+    return None
 
 
 def has_pps_device() -> bool:
@@ -392,8 +461,14 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
         force_ntp_only: If True, don't expect PPS even if USB GPS detected
         recovering: If True, indicate recovery is in progress
     """
-    usb_gps = has_usb_gps()
-    pps_device = has_pps_device()
+    usb_gps, gps_configured, gps_reason = gps_receiver_state()
+    refclock = chrony_has_refclock()
+    if refclock is False:
+        # Nothing for PPS to lock to, whatever is plugged in.
+        if usb_gps:
+            gps_reason += "; no refclock in chrony.conf"
+        usb_gps = False
+    gps_configured = gps_configured or bool(refclock)
     pps_expected = usb_gps and not force_ntp_only
 
     success, sources, error = get_chrony_sources()
@@ -409,7 +484,9 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
             error_message=error,
             usb_gps_detected=usb_gps,
             pps_expected=pps_expected,
-            tracking=tracking
+            tracking=tracking,
+            gps_configured=gps_configured,
+            gps_reason=gps_reason
         )
 
     # Find selected source
@@ -427,7 +504,9 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
                 error_message="No active time source",
                 usb_gps_detected=usb_gps,
                 pps_expected=pps_expected,
-                tracking=tracking
+                tracking=tracking,
+                gps_configured=gps_configured,
+                gps_reason=gps_reason
             )
         return ChronyStatus(
             sources=sources,
@@ -438,7 +517,9 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
             error_message="No active time source",
             usb_gps_detected=usb_gps,
             pps_expected=pps_expected,
-            tracking=tracking
+            tracking=tracking,
+            gps_configured=gps_configured,
+            gps_reason=gps_reason
         )
 
     offset_ms = selected.offset
@@ -472,5 +553,7 @@ def get_status(force_ntp_only: bool = False, recovering: bool = False) -> Chrony
         error_message=None,
         usb_gps_detected=usb_gps,
         pps_expected=pps_expected,
-        tracking=tracking
+        tracking=tracking,
+        gps_configured=gps_configured,
+        gps_reason=gps_reason
     )

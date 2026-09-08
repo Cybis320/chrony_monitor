@@ -109,13 +109,28 @@ python -m chrony_monitor --status
 
 ## Mode Detection
 
-The monitor automatically detects the expected mode:
+The monitor expects GPS PPS only when a receiver is actually present **and**
+`chrony.conf` declares a `refclock`:
 
-1. **USB GPS detected** (`/dev/ttyACM*` or similar) → GPS PPS mode expected
+1. **Receiver present** → GPS PPS mode expected
    - PPS working → Green display
    - PPS not working → Yellow "PPS ISSUE" warning with auto-recovery
-2. **No USB GPS** → NTP-only mode
+2. **No receiver** → NTP-only mode
    - Blue display is normal operation
+   - If the machine is set up for GPS (gpsd `DEVICES` or a `refclock`) but the
+     receiver is missing, a dim `GPS` line says so — without auto-recovery,
+     since restarting services cannot plug a receiver back in.
+
+"Receiver present" is keyed on gpsd's configuration, not on whatever serial
+gadget happens to be plugged in (a USB-serial adapter or an LED flasher is not a
+GPS, and used to put the monitor into a restart loop):
+
+- `DEVICES="..."` set in `/etc/default/gpsd` → present iff one of those device
+  nodes exists right now.
+- `DEVICES` empty (gpsd hotplug mode) → present iff udev has published a
+  `/dev/gpsN` symlink for a recognized receiver.
+
+`python -m chrony_monitor --status` prints the decision and the reason.
 
 ## GPS PPS Hardware Setup
 
