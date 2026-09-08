@@ -118,6 +118,12 @@ fi
 if [ -x /usr/local/bin/update-tempcomp-symlink.sh ] && [ -f "$REPO_DIR/scripts/migrate-tempcomp-sensor.sh" ]; then
     bash "$REPO_DIR/scripts/migrate-tempcomp-sensor.sh" || log "tempcomp sensor migration skipped"
 fi
+# Idempotent: keeps the chronyd AppArmor allowance for the sensor node current
+# (rewrites + reloads only when the managed block differs). Without it the
+# stock Debian/Ubuntu profile denies the sensor and tempcomp is silently inert.
+if [ -f "$REPO_DIR/scripts/setup-chronyd-apparmor.sh" ]; then
+    bash "$REPO_DIR/scripts/setup-chronyd-apparmor.sh" || log "chronyd AppArmor setup failed"
+fi
 
 # Self-update the updater's own units. (Not the script: ExecStart points into
 # the checkout, which git already updated.)

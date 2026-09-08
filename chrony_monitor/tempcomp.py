@@ -1,5 +1,6 @@
 """Temperature compensation calibration for chrony."""
 
+import glob
 import logging
 import math
 import os
@@ -126,7 +127,44 @@ def _read_zone_type(zone_dir: str) -> str:
         return ""
 
 
-def rank_temp_sensors() -> list:
+_ZONE_NODE_RE = r'/thermal_zone\d+)/(?:temp|hwmon\d+/temp\d+_input)$'
+
+
+def _zone_dir_of(path: str, thermal_base: str = THERMAL_BASE) -> Optional[str]:
+    """The thermal-zone directory a sensor node belongs to, or None.
+
+    Accepts both node forms a zone exposes: its own `temp`, and the hwmon
+    mirror `hwmonM/tempK_input` that zone_sensor_path() prefers.
+    """
+    if not path:
+        return None
+    m = re.match(r'^(' + re.escape(thermal_base) + _ZONE_NODE_RE, path)
+    return m.group(1) if m else None
+
+
+def _zone_type_of(path: str, thermal_base: str = THERMAL_BASE) -> str:
+    zone_dir = _zone_dir_of(path, thermal_base)
+    return _read_zone_type(zone_dir) if zone_dir else ""
+
+
+def zone_sensor_path(zone_dir: str) -> str:
+    """The node chronyd should read for a thermal zone.
+
+    Prefer the zone's hwmon mirror (`hwmonM/temp1_input`) over its `temp` node.
+    Both report the same millidegrees, but the stock chronyd AppArmor profile on
+    Debian/Ubuntu only allows the hwmon form (`.../thermal_zone*/hwmon*/temp*_input`)
+    and denies `thermal_zone*/temp` outright. A denied sensor fails silently:
+    chronyd logs "Could not read temperature" every interval and applies no
+    compensation at all. Zones with no hwmon mirror (x86_pkg_temp, some SoCs)
+    fall back to `temp`, which setup-chronyd-apparmor.sh makes readable.
+    """
+    for cand in sorted(glob.glob(os.path.join(zone_dir, "hwmon*", "temp1_input"))):
+        if read_temperature(cand) is not None:
+            return cand
+    return os.path.join(zone_dir, "temp")
+
+
+def rank_temp_sensors(thermal_base: str = THERMAL_BASE) -> list:
     """Rank readable thermal zones for tempcomp use.
 
     Returns [(priority, path), ...] best first. Zones reporting an implausible
@@ -137,17 +175,17 @@ def rank_temp_sensors() -> list:
     """
     ranked = []
     try:
-        zones = sorted(d for d in os.listdir(THERMAL_BASE)
+        zones = sorted(d for d in os.listdir(thermal_base)
                        if d.startswith("thermal_zone"))
     except OSError:
         return ranked
     lo, hi = SENSOR_PLAUSIBLE_RANGE_C
     for z in zones:
-        zone_dir = os.path.join(THERMAL_BASE, z)
-        path = os.path.join(zone_dir, "temp")
-        millideg = read_temperature(path)
+        zone_dir = os.path.join(thermal_base, z)
+        millideg = read_temperature(os.path.join(zone_dir, "temp"))
         if millideg is None or not (lo <= millideg / 1000.0 <= hi):
             continue
+        path = zone_sensor_path(zone_dir)
         ztype = _read_zone_type(zone_dir)
         prio = UNKNOWN_ZONE_PRIORITY  # readable but unrecognized: usable, last
         for rx, p in _SENSOR_TYPE_PRIORITY:
@@ -183,14 +221,15 @@ def preferred_sensor_path() -> str:
     return detect_temp_sensor()
 
 
-def sensor_identity(sensor_path: str) -> str:
+def sensor_identity(sensor_path: str, thermal_base: str = THERMAL_BASE) -> str:
     """Return a reboot-stable identity for a sensor.
 
     Thermal-zone indices renumber across kernel updates, so the *path* is not a
     reliable key for "is this the same physical sensor". When the path (or, for
-    the stable STABLE_SENSOR_LINK alias, its symlink target) is a
-    thermal_zoneN/temp node, key on its `type` (e.g. 'pch_cometlake') instead,
-    which follows the hardware. Otherwise fall back to the path.
+    the stable STABLE_SENSOR_LINK alias, its symlink target) is a thermal-zone
+    node -- `thermal_zoneN/temp` or its hwmon mirror `thermal_zoneN/hwmonM/tempK_input`,
+    which are the same sensor -- key on the zone's `type` (e.g. 'pch_cometlake')
+    instead, which follows the hardware. Otherwise fall back to the path.
 
     Only the alias's own link is resolved — not os.path.realpath, which would
     also chase the /sys/class/thermal/thermal_zoneN class symlink down into
@@ -209,12 +248,35 @@ def sensor_identity(sensor_path: str) -> str:
         except OSError:
             pass
     for cand in candidates:
-        m = re.match(r'(/sys/class/thermal/thermal_zone\d+)/temp$', cand)
-        if m:
-            ztype = _read_zone_type(m.group(1))
+        zone_dir = _zone_dir_of(cand, thermal_base)
+        if zone_dir:
+            ztype = _read_zone_type(zone_dir)
             if ztype:
                 return "type:" + ztype
     return "path:" + (sensor_path or "")
+
+
+SENSOR_READ_ERROR = "Could not read temperature"
+
+
+def chrony_sensor_read_failing(since: str = "-3min") -> Optional[bool]:
+    """True if chronyd recently failed to read its tempcomp sensor; None if unknown.
+
+    chronyd reports a sensor it cannot open only to the journal -- an AppArmor
+    denial, a renumbered zone, or a removed hwmon all look the same -- and
+    silently applies no compensation. Watching the journal is the only way the
+    monitor can tell that the directive it wrote is not actually in effect.
+    """
+    try:
+        proc = subprocess.run(
+            ["journalctl", "-q", "--no-pager", "-o", "cat", "--since", since,
+             "-u", "chrony", "-u", "chronyd"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return SENSOR_READ_ERROR in proc.stdout
 
 
 def parse_chrony_tempcomp(conf_paths=None) -> Optional[TempCompConfig]:
@@ -421,6 +483,10 @@ class TempCompCollector:
         # Recalibration logs (shown in display)
         self.recal_logs: list = []
 
+        # Whether chronyd itself can read the configured sensor (journal check)
+        self._read_failing: Optional[bool] = None
+        self._read_failing_time: float = 0
+
     def _update_fit(self):
         """Recompute the quadratic fit and residual std dev. Called periodically."""
         now = time.time()
@@ -493,8 +559,11 @@ class TempCompCollector:
         if tag.startswith("type:"):
             tag = tag[5:]
         elif tag.startswith("path:"):
-            # e.g. '/sys/class/thermal/thermal_zone7/temp' -> 'thermal_zone7'
-            tag = os.path.basename(os.path.dirname(tag[5:])) or tag[5:]
+            # e.g. '/sys/class/thermal/thermal_zone7/temp' (or its
+            # hwmon mirror) -> 'thermal_zone7'
+            zone_dir = _zone_dir_of(tag[5:])
+            tag = (os.path.basename(zone_dir) if zone_dir
+                   else os.path.basename(os.path.dirname(tag[5:])) or tag[5:])
         tag = re.sub(r'[^A-Za-z0-9_.-]', '_', tag)[:48] or "unknown"
         try:
             os.replace(path, f"{path}.{tag}.old")
@@ -690,6 +759,19 @@ class TempCompCollector:
                     if t < cal_min - 2.0 or t > cal_max + 2.0:
                         self._was_extrapolating = True
                 status.is_extrapolating = self._was_extrapolating
+
+        # chronyd cannot read the sensor it was given: the directive is inert
+        # no matter how good the fit is, so this outranks every other warning.
+        if self._config and self._config.is_active:
+            now = time.time()
+            if now - self._read_failing_time > 60:
+                self._read_failing = chrony_sensor_read_failing()
+                self._read_failing_time = now
+            if self._read_failing:
+                # Kept short: the TempComp line already carries four fields and
+                # this must survive an 80-column terminal. README explains the
+                # usual cause (AppArmor) and how to check.
+                status.warning = "chronyd can't read sensor!"
 
         if self._last_recal_time > 0:
             ago = int(time.time() - self._last_recal_time)
@@ -1002,8 +1084,7 @@ def _cli(argv=None) -> int:
         ranked = rank_temp_sensors()
         if args.verbose:
             for prio, path in ranked:
-                print(f"{prio:4d}  {path}  "
-                      f"({_read_zone_type(os.path.dirname(path)) or 'unknown'})",
+                print(f"{prio:4d}  {path}  ({_zone_type_of(path) or 'unknown'})",
                       file=sys.stderr)
         if ranked and ranked[0][0] <= PREFERRED_PRIORITY:
             break
@@ -1017,7 +1098,7 @@ def _cli(argv=None) -> int:
     prio, path = ranked[0]
     if prio > PREFERRED_PRIORITY:
         print(f"warning: settling for a fallback sensor ({path}, "
-              f"{_read_zone_type(os.path.dirname(path)) or 'unknown'}); no "
+              f"{_zone_type_of(path) or 'unknown'}); no "
               f"board/SoC zone appeared", file=sys.stderr)
     print(path)
     return 0

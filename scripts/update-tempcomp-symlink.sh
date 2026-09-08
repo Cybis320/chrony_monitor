@@ -87,6 +87,14 @@ resolve_sensor() {
             [ "$millideg" -ge 5000 ] && [ "$millideg" -le 110000 ] || continue
             t="$(cat "$z/type" 2>/dev/null)" || continue
             if echo "$t" | grep -qiE "$pat"; then
+                # Same node form as the Python ranking: the zone's hwmon
+                # mirror, which the stock chronyd AppArmor profile permits
+                # (it denies the zone's own `temp`). Fall back to `temp`
+                # for zones without one; setup-chronyd-apparmor.sh covers it.
+                local h
+                for h in "$z"/hwmon*/temp1_input; do
+                    [ -r "$h" ] && { echo "$h"; return 0; }
+                done
                 echo "$z/temp"
                 return 0
             fi
@@ -113,5 +121,6 @@ if ! mv -Tf "$tmp" "$LINK"; then
     die "cannot install $LINK"
 fi
 
-ztype="$(cat "$(dirname "$target")/type" 2>/dev/null || true)"
+zdir="${target%/temp}"; zdir="${zdir%/hwmon*/temp1_input}"
+ztype="$(cat "$zdir/type" 2>/dev/null || true)"
 log "$LINK -> $target (${ztype:-unknown})"

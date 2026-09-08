@@ -630,6 +630,10 @@ install_tempcomp_sensor_service() {
     # Repoint any pre-existing raw thermal_zone tempcomp path to the symlink.
     bash "$PROJECT_DIR/scripts/migrate-tempcomp-sensor.sh" || \
         warn "tempcomp sensor migration skipped"
+    # Let chronyd read the node the resolver picks: the stock Debian/Ubuntu
+    # AppArmor profile denies most of them, which disables tempcomp silently.
+    bash "$PROJECT_DIR/scripts/setup-chronyd-apparmor.sh" || \
+        warn "chronyd AppArmor rules not installed; tempcomp may be denied (check journalctl -u chrony)"
 }
 
 # Main installation

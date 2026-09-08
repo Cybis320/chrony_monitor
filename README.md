@@ -68,12 +68,26 @@ before settling for `acpitz`. If no usable sensor is found it leaves the symlink
 alone and fails, and the migration refuses to repoint `chrony.conf` at a link
 that isn't published — a stale sensor beats a missing one.
 
+The link points at the zone's **hwmon mirror**
+(`thermal_zoneN/hwmonM/temp1_input`) rather than its `temp` node. Both report
+the same value, but chronyd is confined by AppArmor on Debian/Ubuntu and the
+stock profile only allows the hwmon form. Zones without a mirror (e.g.
+`x86_pkg_temp`) fall back to `temp`, and `setup-chronyd-apparmor.sh` (run by
+`install.sh` and `update.sh`) adds a managed block to
+`/etc/apparmor.d/local/usr.sbin.chronyd` so chronyd can read whichever node was
+picked. A sensor chronyd cannot read is a silent failure — it just logs
+`Could not read temperature` and applies no compensation — so the monitor
+watches the journal and shows `chronyd can't read sensor!` in the
+TempComp line when that happens.
+
 To see what it picked, or to check a machine by hand:
 
 ```bash
 readlink /run/chrony-monitor/tempcomp-sensor
 sudo PYTHONPATH=/usr/local/lib/chrony-monitor \
     python3 -m chrony_monitor.tempcomp --verbose
+journalctl -u chrony --since -10min | grep "Could not read temperature"   # must be empty
+sudo scripts/setup-chronyd-apparmor.sh --dry-run
 ```
 
 The resolver imports a root-owned copy of the package at

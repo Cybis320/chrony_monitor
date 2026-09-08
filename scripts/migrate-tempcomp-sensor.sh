@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # One-time migration: repoint an existing chrony.conf tempcomp directive from a
-# raw /sys/class/thermal/thermal_zoneN/temp path to the reboot-stable symlink
+# raw thermal-zone node (/sys/class/thermal/thermal_zoneN/temp, or its hwmon
+# mirror thermal_zoneN/hwmonM/tempK_input) to the reboot-stable symlink
 # published by chrony-tempcomp-sensor.service.
 #
 # Idempotent: does nothing if there's no tempcomp line, or it already uses the
@@ -34,7 +35,7 @@ fi
 [ -z "$CHRONY_CONF" ] && { echo "migrate-tempcomp: chrony.conf not found"; exit 0; }
 
 # Only act on a tempcomp line (active or commented) that names a raw thermal zone.
-if ! grep -qE '^[[:space:]]*#?[[:space:]]*tempcomp[[:space:]]+/sys/class/thermal/thermal_zone[0-9]+/temp' "$CHRONY_CONF"; then
+if ! grep -qE '^[[:space:]]*#?[[:space:]]*tempcomp[[:space:]]+/sys/class/thermal/thermal_zone[0-9]+/(temp|hwmon[0-9]+/temp[0-9]+_input)[[:space:]]' "$CHRONY_CONF"; then
     echo "migrate-tempcomp: nothing to migrate"
     exit 0
 fi
@@ -64,7 +65,7 @@ cp "$CHRONY_CONF" "${CHRONY_CONF}.bak.pre-sensor-migration" || {
 # keeps chrony.conf's own inode, mode and owner.
 tmp="$(mktemp)" || { echo "migrate-tempcomp: mktemp failed" >&2; exit 1; }
 if ! sed -E \
-    "s|(^[[:space:]]*#?[[:space:]]*tempcomp[[:space:]]+)/sys/class/thermal/thermal_zone[0-9]+/temp|\1${LINK}|" \
+    "s|(^[[:space:]]*#?[[:space:]]*tempcomp[[:space:]]+)/sys/class/thermal/thermal_zone[0-9]+/(temp\|hwmon[0-9]+/temp[0-9]+_input)([[:space:]])|\1${LINK}\3|" \
     "$CHRONY_CONF" > "$tmp"; then
     rm -f "$tmp"
     echo "migrate-tempcomp: rewrite failed — config untouched" >&2
