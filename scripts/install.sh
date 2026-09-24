@@ -350,6 +350,20 @@ install_desktop_file() {
         TARGET_HOME="$HOME"
     fi
 
+    # Preferred: the launchers run the monitor from the user's own checkout
+    # (~/source/CC_Utils/chrony_monitor), which the updater keeps on this commit.
+    if MONITOR_USER="${SUDO_USER:-}" bash "$PROJECT_DIR/scripts/sync-user-checkout.sh" --launchers; then
+        info "Launchers run the monitor from ${TARGET_HOME}/source/CC_Utils/chrony_monitor"
+        install_sudo_rules
+        return
+    fi
+    warn "No user checkout — launchers run the monitor from $PROJECT_DIR"
+    install_legacy_desktop_file
+    install_sudo_rules
+}
+
+# Fallback launchers pointing at this checkout (no user checkout available).
+install_legacy_desktop_file() {
     # Detect terminal emulator
     TERM_CMD=""
     if command -v gnome-terminal &>/dev/null; then
@@ -367,10 +381,10 @@ install_desktop_file() {
     # Generate desktop file with correct project path and terminal
     DESKTOP_FILE="$(mktemp)"
     if [ -n "$TERM_CMD" ]; then
-        sed "s|^Exec=.*|Exec=$TERM_CMD python3 -m chrony_monitor\nPath=$PROJECT_DIR\nTerminal=false|" \
+        sed "s|^Exec=.*|Exec=$TERM_CMD python3 -m chrony_monitor\nPath=$PROJECT_DIR\nTerminal=false|; s|^Icon=.*|Icon=$PROJECT_DIR/icon.png|" \
             "$PROJECT_DIR/autostart/chrony-monitor.desktop" > "$DESKTOP_FILE"
     else
-        sed "s|^Exec=.*|Exec=python3 -m chrony_monitor\nPath=$PROJECT_DIR\nTerminal=true|" \
+        sed "s|^Exec=.*|Exec=python3 -m chrony_monitor\nPath=$PROJECT_DIR\nTerminal=true|; s|^Icon=.*|Icon=$PROJECT_DIR/icon.png|" \
             "$PROJECT_DIR/autostart/chrony-monitor.desktop" > "$DESKTOP_FILE"
     fi
 
@@ -397,7 +411,17 @@ install_desktop_file() {
         chown "$SUDO_USER:$SUDO_USER" "$DESKTOP_DIR" "$AUTOSTART_DIR"
         chown "$SUDO_USER:$SUDO_USER" "$DESKTOP_DIR/chrony-monitor.desktop" "$AUTOSTART_DIR/chrony-monitor.desktop"
         [ -f "$DESKTOP_SHORTCUT" ] && chown "$SUDO_USER:$SUDO_USER" "$DESKTOP_SHORTCUT"
+    fi
 
+    rm -f "$DESKTOP_FILE"
+
+    info "Desktop launcher installed at $DESKTOP_DIR/chrony-monitor.desktop"
+    info "Autostart enabled at $AUTOSTART_DIR/chrony-monitor.desktop"
+}
+
+# Group membership, tempcomp helper and sudoers rules for the monitor user.
+install_sudo_rules() {
+    if [ -n "$SUDO_USER" ]; then
         # Add user to dialout group for serial/GPS device access
         if ! id -nG "$SUDO_USER" | grep -qw dialout; then
             usermod -aG dialout "$SUDO_USER"
@@ -430,11 +454,6 @@ SUDOEOF
         chmod 440 /etc/sudoers.d/chrony-monitor
         info "Sudoers rules installed for passwordless service recovery"
     fi
-
-    rm -f "$DESKTOP_FILE"
-
-    info "Desktop launcher installed at $DESKTOP_DIR/chrony-monitor.desktop"
-    info "Autostart enabled at $AUTOSTART_DIR/chrony-monitor.desktop"
 }
 
 # Start or restart services

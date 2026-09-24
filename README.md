@@ -23,13 +23,23 @@ A visual monitor for chrony time synchronization with automatic GPS PPS detectio
 ### One-line install (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Cybis320/chrony_monitor/main/install | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Cybis320/chrony_monitor/main/install.sh | bash
 ```
 
-This clones the repo to `/opt/chrony_monitor`, runs the full provisioner, and
-enables a daily auto-updater. Run it from your normal user account (via `sudo`)
-so the monitor is set up for the right login user. The single `sudo` password
-prompt covers the whole install.
+Run it from your normal user account. It re-runs itself under `sudo`, so you
+get a single password prompt for the whole install and the monitor is set up
+for the right login user. `| sudo bash` works too, and so does the older
+`.../main/install | sudo bash` one-liner.
+
+The install creates two checkouts, on purpose:
+
+| Checkout | Owner | Role |
+|---|---|---|
+| `/opt/chrony_monitor` | root | The daily root updater pulls it from GitHub and installs the root-side pieces from it (systemd units, sudoers, tempcomp helper). Root never runs code from a directory a user can write to. |
+| `~/source/CC_Utils/chrony_monitor` | you | The desktop launcher and autostart run the monitor from here. Every update moves it to the same commit as `/opt`, and the updater runs git there as you, not as root. |
+
+On installs that predate the second checkout, the daily updater creates it and
+repoints the launchers there, once.
 
 The monitor keeps itself current: a daily systemd timer pulls the latest code,
 and the running monitor re-execs into it automatically — no manual updates. It

@@ -142,6 +142,14 @@ if [ "$RELOAD" -eq 1 ]; then
     systemctl enable --now chrony-monitor-update.timer 2>/dev/null || true
 fi
 
+# Keep the user's ~/source/CC_Utils/chrony_monitor (what the launcher and
+# autostart run) on this commit. On installs that predate it, create it and
+# repoint the launchers there, once. Every step there runs as MONITOR_USER.
+if [ -f "$REPO_DIR/scripts/sync-user-checkout.sh" ]; then
+    MONITOR_USER="$MONITOR_USER" bash "$REPO_DIR/scripts/sync-user-checkout.sh" \
+        || log "user checkout not synced (see above)"
+fi
+
 # Warn (don't auto-run) if the full provisioner changed — re-running it would
 # rewrite chrony.conf, so a human should decide.
 if changed "scripts/install.sh"; then
