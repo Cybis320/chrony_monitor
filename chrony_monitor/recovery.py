@@ -43,8 +43,8 @@ def query_gps_fix() -> GpsFix:
     """
     Ask gpsd for the current fix state.
 
-    An unreachable gpsd yields reachable=False,
-    which callers must treat as "unknown" rather than "no fix".
+    An unreachable gpsd yields reachable=False, which callers must treat as
+    "unknown" rather than "no fix".
     """
     try:
         out = gpsd_lines(15, timeout=8)
@@ -70,6 +70,30 @@ def query_gps_fix() -> GpsFix:
                 fix.satellites_visible = max(fix.satellites_visible, int(msg['nSat']))
 
     return fix
+
+
+PPS_SYSFS = "/sys/class/pps"
+
+
+def pps_never_pulsed(pps_dev: str, sysfs: str = PPS_SYSFS) -> bool:
+    """
+    True if the kernel PPS device exists and has counted no edge of either
+    polarity since it was created.
+
+    The sysfs assert/clear files read "<sec>.<nsec>#<sequence>", are world
+    readable, and reset when ldattach re-creates the device. False when the
+    device or its counters can't be read: that's unknown, and a restart may be
+    what brings the device back.
+    """
+    name = os.path.basename(os.path.realpath(pps_dev))
+    try:
+        for edge in ("assert", "clear"):
+            with open(os.path.join(sysfs, name, edge)) as f:
+                if int(f.read().strip().rsplit("#", 1)[1]) != 0:
+                    return False
+    except (OSError, ValueError, IndexError):
+        return False
+    return True
 
 
 @dataclass
@@ -151,7 +175,7 @@ class RecoveryManager:
             return False
 
         if self.reception_fault is not None:
-            self._log("GPS fix restored — recovery re-armed")
+            self._log("Fault cleared — recovery re-armed")
             self.reception_fault = None
             self._fault_logged_time = None
 
@@ -159,7 +183,8 @@ class RecoveryManager:
 
     def _check_reception_fault(self) -> Optional[str]:
         """
-        Return a reason string when the fault is reception rather than services.
+        Return a reason string when restarting services can't fix the fault:
+        the receiver has no fix, or nothing is wired to the PPS input.
 
         A receiver that is talking to gpsd but has no fix has a dead antenna or
         has lost sky view. The timepulse only runs while the receiver is locked,
@@ -171,11 +196,20 @@ class RecoveryManager:
         """
         fix = query_gps_fix()
 
-        if not fix.receiver_talking or fix.has_fix:
-            return None
+        if fix.receiver_talking and not fix.has_fix:
+            return (f"GPS has no fix ({fix.satellites_used}/{fix.satellites_visible} "
+                    f"sats used) — check antenna; skipping service restart")
 
-        return (f"GPS has no fix ({fix.satellites_used}/{fix.satellites_visible} "
-                f"sats used) — check antenna; skipping service restart")
+        # A PPS device that has never seen an edge has nothing wired to it: a
+        # GPS without a PPS output (USB-only puck), or the motherboard UART
+        # init-serial-pps.sh falls back to. A restart re-creates the device, so
+        # a line that went dead mid-run still gets one attempt, then lands here.
+        pps_dev = self._get_pps_device()
+        if pps_never_pulsed(pps_dev):
+            return (f"No PPS pulses on {os.path.realpath(pps_dev)} since it was "
+                    f"attached — is PPS wired?; skipping service restart")
+
+        return None
 
     def _reception_fault(self) -> Optional[str]:
         """Cached _check_reception_fault, so gpsd is polled at most once per interval."""
