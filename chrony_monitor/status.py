@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from .gpsd import gpsd_lines
+
 
 class SyncState(Enum):
     """Overall synchronization state."""
@@ -294,12 +296,7 @@ def _parse_seconds_to_us(val: str) -> float:
 def get_gps_info() -> Optional[GpsInfo]:
     """Get GPS satellite info from gpsd."""
     try:
-        out = subprocess.check_output(
-            ["gpspipe", "-w", "-n", "15"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5
-        )
+        out = gpsd_lines(15, timeout=5)
     except Exception:
         return None
 

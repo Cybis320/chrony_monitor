@@ -67,7 +67,10 @@ install_dependencies() {
     info "Checking system dependencies..."
 
     PACKAGES_NEEDED=""
-    for pkg in gpsd gpsd-clients pps-tools chrony setserial; do
+    # Not gpsd-clients: on Ubuntu it depends on python3-matplotlib, which
+    # clashes with the pip matplotlib in RMS's vRMS (a --system-site-packages
+    # venv). The monitor talks to gpsd's socket itself (chrony_monitor/gpsd.py).
+    for pkg in gpsd pps-tools chrony setserial; do
         if ! dpkg -s "$pkg" &>/dev/null; then
             PACKAGES_NEEDED="$PACKAGES_NEEDED $pkg"
         fi
@@ -529,7 +532,8 @@ validate_hardware() {
     # Check gpsd
     if systemctl is-active --quiet gpsd; then
         info "GPSD is running"
-        timeout 2 gpspipe -w -n 5 2>/dev/null | grep -q "TPV" && info "GPS has fix" || warn "Waiting for GPS fix..."
+        PYTHONPATH="$PROJECT_DIR" python3 -c 'from chrony_monitor.gpsd import gpsd_lines; print(gpsd_lines(15, 5))' 2>/dev/null \
+            | grep -q "TPV" && info "GPS has fix" || warn "Waiting for GPS fix..."
     else
         warn "GPSD is not running"
     fi

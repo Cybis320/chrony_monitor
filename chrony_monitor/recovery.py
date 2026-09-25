@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional, Tuple
 
+from .gpsd import gpsd_lines
+
 
 def is_raspberry_pi() -> bool:
     """Detect if running on a Raspberry Pi."""
@@ -41,16 +43,11 @@ def query_gps_fix() -> GpsFix:
     """
     Ask gpsd for the current fix state.
 
-    An unreachable gpsd (dead, or gpspipe not installed) yields reachable=False,
+    An unreachable gpsd yields reachable=False,
     which callers must treat as "unknown" rather than "no fix".
     """
     try:
-        out = subprocess.check_output(
-            ["gpspipe", "-w", "-n", "15"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=8
-        )
+        out = gpsd_lines(15, timeout=8)
     except Exception:
         return GpsFix()
 
