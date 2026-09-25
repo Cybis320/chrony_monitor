@@ -59,6 +59,16 @@ Both paths install:
 - Passwordless sudo for service recovery and tempcomp recalibration
 - Daily auto-updater (`chrony-monitor-update.timer`)
 - Stable tempcomp sensor symlink service (`chrony-tempcomp-sensor.service`)
+- NTP server for the LAN: `/etc/chrony/conf.d/ntp-server.conf` allows clients
+  from private ranges (RFC 1918, IPv6 ULA/link-local), and UDP 123 in ufw if it
+  is active. It lives outside `chrony.conf`, so re-provisioning keeps it, and the
+  daily updater re-asserts it. Check with `sudo chronyc serverstats`.
+
+`chrony.conf` is the same template on every station; re-provisioning rewrites
+it, keeping only the fitted `tempcomp` line. Put site time servers (a LAN
+stratum 1, an institutional server behind a firewall) in
+`/etc/chrony/sources.d/<name>.sources`, which is never touched, e.g.
+`server 192.168.50.127 iburst prefer minpoll 4 maxpoll 6`.
 
 ### Stable temperature sensor
 

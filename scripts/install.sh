@@ -168,6 +168,15 @@ EOF
 configure_chrony() {
     info "Writing chrony configuration for GPS+PPS..."
 
+    # chrony.conf is this template on every station. The one per-machine line
+    # is the tempcomp calibration the monitor fitted, so carry it over rather
+    # than make the station re-collect days of data. Site time servers belong
+    # in /etc/chrony/sources.d/*.sources, which this never touches.
+    TEMPCOMP_LINE="$(grep -E '^[[:space:]]*tempcomp[[:space:]]' /etc/chrony/chrony.conf 2>/dev/null | tail -n 1)"
+    if [ -n "$TEMPCOMP_LINE" ]; then
+        info "Keeping existing tempcomp calibration: $TEMPCOMP_LINE"
+    fi
+
     backup_config /etc/chrony/chrony.conf
 
     if is_raspberry_pi; then
@@ -210,13 +219,27 @@ rtcsync
 makestep 1 3
 leapsectz right/UTC
 
+# Keep chronyd out of swap and ahead of video capture, so PPS and NTP
+# timestamps aren't delayed by page faults or a busy CPU.
+lock_all
+sched_priority 1
+
 # Optimize for GPS/PPS
 maxupdateskew 100.0
 maxclockerror 0.001
 maxsamples 32
+${TEMPCOMP_LINE}
 EOF
 
     info "Chrony configuration written."
+}
+
+# Serve NTP to the LAN. Kept in a conf.d drop-in, not the chrony.conf written
+# above, so the allow rules survive this template being rewritten.
+configure_ntp_server() {
+    info "Configuring chrony as an NTP server for the local network..."
+    bash "$PROJECT_DIR/scripts/setup-ntp-server.sh" || \
+        warn "NTP server not configured; clients will get no answer (see /etc/chrony/conf.d)"
 }
 
 # Set up GPS PPS (requires root)
@@ -668,6 +691,7 @@ main() {
     install_systemd_services
     configure_gpsd
     configure_chrony
+    configure_ntp_server
     setup_gps_pps
     install_desktop_file
     install_updater

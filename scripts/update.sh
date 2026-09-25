@@ -125,6 +125,13 @@ if [ -f "$REPO_DIR/scripts/setup-chronyd-apparmor.sh" ]; then
     bash "$REPO_DIR/scripts/setup-chronyd-apparmor.sh" || log "chronyd AppArmor setup failed"
 fi
 
+# Idempotent: keeps chronyd serving NTP to the LAN (conf.d drop-in, applied to
+# the running daemon without a restart). Restores it on stations provisioned
+# before the drop-in existed, whose allow line install.sh wiped.
+if [ -f "$REPO_DIR/scripts/setup-ntp-server.sh" ]; then
+    bash "$REPO_DIR/scripts/setup-ntp-server.sh" || log "NTP server setup failed"
+fi
+
 # Self-update the updater's own units. (Not the script: ExecStart points into
 # the checkout, which git already updated.)
 if stale "$REPO_DIR/systemd/chrony-monitor-update.service" /etc/systemd/system/chrony-monitor-update.service \
