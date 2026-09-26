@@ -56,6 +56,11 @@ if [ "$(readlink -f "$DEST")" != "$(readlink -f "$REPO_DIR")" ]; then
     URL="$(git -C "$REPO_DIR" remote get-url origin)"
     BRANCH="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
     TARGET="$(git -C "$REPO_DIR" rev-parse HEAD)"
+    # The root-owned checkout trips git's ownership check when the user reads
+    # it ("dubious ownership"). The upload-pack serving it is a separate process
+    # that ignores a plain `git -c`, so the exception has to ride on it. Root's
+    # own checkout is trusted by construction.
+    UPLOAD_PACK="git -c safe.directory=$REPO_DIR/.git -c safe.directory=$REPO_DIR upload-pack"
 
     if [ ! -d "$DEST/.git" ]; then
         if [ -e "$DEST" ]; then
@@ -65,13 +70,13 @@ if [ "$(readlink -f "$DEST")" != "$(readlink -f "$REPO_DIR")" ]; then
         log "Creating $DEST"
         as_user mkdir -p "$(dirname "$DEST")"
         # From the root copy: no network needed, and it has TARGET by construction.
-        as_user git clone --quiet --no-local "$REPO_DIR" "$DEST"
+        as_user git clone --quiet --no-local --upload-pack "$UPLOAD_PACK" "$REPO_DIR" "$DEST"
         as_user git -C "$DEST" remote set-url origin "$URL"
         LAUNCHERS=1
     fi
 
     if [ "$(as_user git -C "$DEST" rev-parse HEAD 2>/dev/null || true)" != "$TARGET" ]; then
-        as_user git -C "$DEST" fetch --quiet "$REPO_DIR" HEAD
+        as_user git -C "$DEST" fetch --quiet --upload-pack "$UPLOAD_PACK" "$REPO_DIR" HEAD
         if ! as_user git -C "$DEST" diff --quiet 2>/dev/null; then
             as_user git -C "$DEST" stash push --quiet -m "chrony-monitor sync $(date -u +%Y%m%d-%H%M%S)" || true
             log "local edits in $DEST stashed"

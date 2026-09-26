@@ -31,10 +31,30 @@ OLD="$(git -C "$REPO_DIR" rev-parse HEAD)"
 # A failed fetch is not a reason to skip the verification pass below: repairing
 # runtime artifacts needs no network, only the checkout that's already here, and
 # an offline station is exactly the one that can least afford to stay broken.
+# It does make the run exit non-zero at the end, so a station that has stopped
+# updating shows up as a failed unit instead of logging "up to date" forever.
+FAILED=0
 if git -C "$REPO_DIR" fetch --quiet origin "$BRANCH"; then
     git -C "$REPO_DIR" reset --hard --quiet "origin/$BRANCH"
+elif git -C "$REPO_DIR" ls-remote --exit-code --heads origin >/dev/null 2>&1 \
+     && ! git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+    # Origin answers but the branch is gone (a merged feature branch the station
+    # was provisioned from). Retrying it can never succeed; move to the default.
+    DEFAULT="$(git -C "$REPO_DIR" ls-remote --symref origin HEAD 2>/dev/null \
+        | awk '/^ref:/ { sub("refs/heads/", "", $2); print $2 }')"
+    DEFAULT="${DEFAULT:-main}"
+    log "branch $BRANCH no longer exists on origin — switching to $DEFAULT"
+    if git -C "$REPO_DIR" fetch --quiet origin "$DEFAULT"; then
+        git -C "$REPO_DIR" checkout --quiet --force -B "$DEFAULT" FETCH_HEAD
+        git -C "$REPO_DIR" branch --quiet --set-upstream-to="origin/$DEFAULT" 2>/dev/null || true
+        BRANCH="$DEFAULT"
+    else
+        log "git fetch of $DEFAULT failed — verifying runtime artifacts against the current checkout"
+        FAILED=1
+    fi
 else
     log "git fetch failed — verifying runtime artifacts against the current checkout"
+    FAILED=1
 fi
 NEW="$(git -C "$REPO_DIR" rev-parse HEAD)"
 
@@ -153,8 +173,14 @@ fi
 # autostart run) on this commit. On installs that predate it, create it and
 # repoint the launchers there, once. Every step there runs as MONITOR_USER.
 if [ -f "$REPO_DIR/scripts/sync-user-checkout.sh" ]; then
-    MONITOR_USER="$MONITOR_USER" bash "$REPO_DIR/scripts/sync-user-checkout.sh" \
-        || log "user checkout not synced (see above)"
+    # Exit 2 is a deliberate skip (no monitor user, a non-git directory in the
+    # way); anything else non-zero is a real failure.
+    rc=0
+    MONITOR_USER="$MONITOR_USER" bash "$REPO_DIR/scripts/sync-user-checkout.sh" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "user checkout not synced (see above)"
+        [ "$rc" -eq 2 ] || FAILED=1
+    fi
 fi
 
 # Warn (don't auto-run) if the full provisioner changed — re-running it would
@@ -168,3 +194,4 @@ if [ "$OLD" != "$NEW" ]; then
 else
     log "Runtime artifacts verified"
 fi
+exit "$FAILED"
