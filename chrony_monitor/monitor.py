@@ -70,9 +70,11 @@ class Monitor:
         self._rms_minute_count = 0
         self._last_good_status = None
         self._error_count = 0
-        # Self-update: remember the commit we started on; re-exec if it moves.
+        # The commit this process loaded its code from (shown in the footer).
+        # Self-update re-execs once the checkout moves past it.
         self._repo_dir = _repo_dir()
-        self._start_head = _current_head(self._repo_dir) if self.config.self_update else None
+        self._head = _current_head(self._repo_dir)
+        self._start_head = self._head if self.config.self_update else None
         self._last_update_check = time.time()
         self._restart_requested = False
         self.tempcomp = None
@@ -94,7 +96,7 @@ class Monitor:
     def run(self, scr):
         """Main monitor loop (called by curses.wrapper)."""
         self.running = True
-        display = Display(scr)
+        display = Display(scr, version=self._head[:7] if self._head else None)
 
         while self.running:
             # Get current status — tolerate transient chronyc timeouts

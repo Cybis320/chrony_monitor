@@ -204,8 +204,9 @@ def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
 class Display:
     """Curses display manager."""
 
-    def __init__(self, scr):
+    def __init__(self, scr, version: Optional[str] = None):
         self.scr = scr
+        self.version = version
         curses.curs_set(0)
         init_colors()
 
@@ -288,6 +289,11 @@ class Display:
             if status.pps_expected:
                 footer = "Auto-recovery enabled | " + footer
             self._addstr(h - 1, 2, footer, curses.A_DIM)
+            # Running commit, right-aligned; dropped if it would hit the footer
+            if self.version:
+                col = w - len(self.version) - 2
+                if col > 2 + len(footer):
+                    self._addstr(h - 1, col, self.version, curses.A_DIM)
 
         self.scr.refresh()
 
