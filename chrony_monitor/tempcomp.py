@@ -31,6 +31,14 @@ STUCK_SENSOR_MIN_FREQ_SPAN = 0.1  # ppm
 # Auto-recalibration safeguards
 MIN_RECAL_INTERVAL = 86400      # 24 hours between recalibrations
 MIN_IMPROVEMENT = 0.3           # New fit must reduce residual slope by 30%
+
+# chronyd rejects a compensation beyond ±10 ppm (MAX_COMP in its tempcomp.c)
+# and keeps applying the last value it accepted.
+CHRONY_MAX_COMP = 10.0          # ppm
+# A calibration must stay within that limit over all but this share of
+# samples at each end of the operating range; in the rare excursions past it
+# chronyd holds the compensation at about the limit.
+COMP_LIMIT_TAIL = 0.005
 CONF_PATHS = ["/etc/chrony/chrony.conf", "/etc/chrony.conf"]
 
 
@@ -416,6 +424,22 @@ def _residual_slope(temps: list, freqs: list) -> float:
     return (n * sxy - sx * sy) / denom
 
 
+def _center_compensation(temps: list, T0: float, k0: float, k1: float,
+                         k2: float) -> tuple:
+    """Shift k0 so the compensation is centered on the operating range.
+
+    The fitted k0 carries the crystal's absolute frequency offset, which
+    chronyd's own frequency estimate absorbs anyway; left in, it spends
+    chronyd's ±10 ppm budget on a constant. Returns (k0, half_span): the
+    shifted k0, and the largest |compensation| it gives over all but the
+    outer COMP_LIMIT_TAIL of samples at each end.
+    """
+    comps = sorted(k0 + k1 * (t - T0) + k2 * (t - T0) ** 2 for t in temps)
+    tail = int(len(comps) * COMP_LIMIT_TAIL)
+    lo, hi = comps[tail], comps[-1 - tail]
+    return k0 - (lo + hi) / 2, (hi - lo) / 2
+
+
 def _filter_outliers(temps: list, freqs: list) -> tuple:
     """Remove frequency outliers using IQR method.
 
@@ -655,7 +679,11 @@ class TempCompCollector:
             # If chrony's sensor is unreadable, chrony isn't compensating
             # either, so the measured frequency is already the raw one.
             if comp_temp is not None:
-                raw_freq = frequency_ppm + _compute_compensation(self._config, comp_temp)
+                # Past its limit chronyd keeps the last value it accepted,
+                # which is about the limit since temperature crosses it slowly.
+                comp = _compute_compensation(self._config, comp_temp)
+                comp = max(-CHRONY_MAX_COMP, min(CHRONY_MAX_COMP, comp))
+                raw_freq = frequency_ppm + comp
 
         self._minute_temps.append(temp_millideg)
         self._minute_freqs.append(raw_freq)
@@ -811,12 +839,6 @@ class TempCompCollector:
             return
         new_T0, new_k0, new_k1, new_k2 = _polyfit_quadratic(temps_md, freqs)
 
-        # Check compensation value is within chrony's ±10 ppm limit
-        for t in temps_md:
-            comp = new_k0 + new_k1 * (t - new_T0) + new_k2 * (t - new_T0) ** 2
-            if abs(comp) > 10.0:
-                return  # coefficients would be rejected by chrony
-
         if self._config and self._config.is_active and self._config_matches_sensor():
             # Compare residual slope: current vs proposed
             # Simulate what the residual frequency would be with each compensation
@@ -850,6 +872,18 @@ class TempCompCollector:
             r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0
             if r_squared < 0.6:
                 return  # temperature doesn't explain enough frequency variance
+
+        # Fit chronyd's ±10 ppm limit. Done after the quality checks, which
+        # need the uncentered fit, so a skip is only logged for a calibration
+        # that would otherwise have been applied; it counts as an attempt so
+        # the log gets one entry per cooldown rather than one a minute.
+        new_k0, half_span = _center_compensation(
+            temps_md, new_T0, new_k0, new_k1, new_k2)
+        if half_span > CHRONY_MAX_COMP:
+            self._last_attempt_time = time.time()
+            self._log_recal(f"Skipped: needs ±{half_span:.1f}ppm, beyond "
+                            f"chronyd's ±{CHRONY_MAX_COMP:.0f}ppm limit")
+            return
 
         # Apply the new calibration
         self._apply_calibration(new_T0, new_k0, new_k1, new_k2)
