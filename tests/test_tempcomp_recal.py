@@ -1,7 +1,9 @@
-"""Recalibration must fit chronyd's ±10 ppm limit by centering k0 rather than
-silently giving up on a curve that only fails because of the crystal's offset."""
+"""Recalibration: chronyd reports raw + comp, so a calibration must be the
+negated raw curve, centered to fit chronyd's ±10 ppm limit; and data recorded
+with the sign reversed must be repaired before anything is fitted to it."""
 import os
 import tempfile
+import time
 import unittest
 
 from chrony_monitor import tempcomp
@@ -11,6 +13,10 @@ def parabola(offset, k1, k2, T0=60000):
     """Raw crystal frequency (ppm) vs millidegrees: the crystal's offset plus
     a temperature curve."""
     return lambda t: offset + k1 * (t - T0) + k2 * (t - T0) ** 2
+
+
+def comp_of(T0, k0, k1, k2):
+    return lambda t: k0 + k1 * (t - T0) + k2 * (t - T0) ** 2
 
 
 class CenterCompensationTest(unittest.TestCase):
@@ -33,9 +39,9 @@ class CenterCompensationTest(unittest.TestCase):
 class RecalibrationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.sensor = os.path.join(self.tmp.name, "no-sensor")
         self.c = tempcomp.TempCompCollector(
-            sensor_path=os.path.join(self.tmp.name, "no-sensor"),
-            data_dir=self.tmp.name)
+            sensor_path=self.sensor, data_dir=self.tmp.name)
         self.applied = []
         self.c._apply_calibration = lambda *k: self.applied.append(k)
 
@@ -49,17 +55,25 @@ class RecalibrationTest(unittest.TestCase):
             self.c._temps.append(t)
             self.c._freqs.append(f(t))
 
-    def test_offset_curve_is_applied_centered(self):
-        # -7 ppm at the vertex, over +12 at the cold end: out of chronyd's
-        # range as fitted, inside it once the offset is centered away.
+    def activate(self, T0, k0, k1, k2):
+        self.c._config = tempcomp.TempCompConfig(
+            sensor_path=self.sensor, interval=30, T0=T0,
+            k0=k0, k1=k1, k2=k2, is_active=True)
+
+    def test_applied_compensation_flattens_reported_frequency(self):
+        # -7 ppm at the vertex, over +12 at the cold end: its negation is out
+        # of chronyd's range as fitted, inside it once centered.
         f = parabola(-7.0, 0.0, 6e-8, T0=63000)
         self.fill(f, hi=79000)
-        self.assertGreater(max(f(t) for t in self.c._temps), tempcomp.CHRONY_MAX_COMP)
+        self.assertGreater(max(abs(f(t)) for t in self.c._temps),
+                           tempcomp.CHRONY_MAX_COMP)
         self.c._check_recalibration()
         self.assertEqual(len(self.applied), 1)
-        T0, k0, k1, k2 = self.applied[0]
-        comps = [k0 + k1 * (t - T0) + k2 * (t - T0) ** 2 for t in self.c._temps]
-        self.assertLessEqual(max(abs(x) for x in comps), tempcomp.CHRONY_MAX_COMP)
+        comp = comp_of(*self.applied[0])
+        reported = [f(t) + comp(t) for t in self.c._temps]
+        self.assertLess(max(reported) - min(reported), 0.01)
+        self.assertLessEqual(max(abs(comp(t)) for t in self.c._temps),
+                             tempcomp.CHRONY_MAX_COMP)
 
     def test_curve_wider_than_limit_is_skipped_and_logged(self):
         self.fill(parabola(0.0, 7e-4, 0.0))              # 26.6 ppm span
@@ -71,17 +85,122 @@ class RecalibrationTest(unittest.TestCase):
         self.c._check_recalibration()
         self.assertEqual(len(self.c.recal_logs), 1)
 
+    def test_reversed_calibration_is_replaced(self):
+        self.fill(parabola(0.0, -3e-4, 0.0))
+        self.activate(60000, 0.0, -3e-4, 0.0)            # doubles the slope
+        self.c._check_recalibration()
+        self.assertEqual(len(self.applied), 1)
+
+    def test_correct_calibration_is_kept(self):
+        self.fill(parabola(0.0, -3e-4, 0.0))
+        self.activate(60000, 0.0, 3e-4, 0.0)             # cancels it exactly
+        self.c._check_recalibration()
+        self.assertEqual(self.applied, [])
+
+    def test_reversed_calibration_skips_cooldown(self):
+        self.fill(parabola(0.0, -3e-4, 0.0))
+        self.activate(60000, 0.0, -3e-4, 0.0)
+        self.c._last_recal_time = time.time() - 60
+        self.c._check_recalibration()
+        self.assertEqual(self.applied, [])
+        open(self.c._cal_reversed_path, 'w').close()
+        self.c._check_recalibration()
+        self.assertEqual(len(self.applied), 1)
+
 
 class RecordTest(unittest.TestCase):
-    def test_reconstruction_holds_compensation_at_chronyd_limit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            sensor = os.path.join(tmp, "temp")
-            c = tempcomp.TempCompCollector(sensor_path=sensor, data_dir=tmp)
-            c._config = tempcomp.TempCompConfig(
-                sensor_path=sensor, interval=30, T0=60000,
-                k0=0.0, k1=1e-3, k2=0.0, is_active=True)
-            c.record(75000, 2.0)                         # formula says 15 ppm
-            self.assertAlmostEqual(c._minute_freqs[-1], 12.0)
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        sensor = os.path.join(self.tmp.name, "temp")
+        self.c = tempcomp.TempCompCollector(sensor_path=sensor,
+                                            data_dir=self.tmp.name)
+        self.c._config = tempcomp.TempCompConfig(
+            sensor_path=sensor, interval=30, T0=60000,
+            k0=0.0, k1=1e-4, k2=0.0, is_active=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_raw_is_reported_minus_compensation(self):
+        self.c.record(70000, 2.0)                        # comp 1 ppm
+        self.assertAlmostEqual(self.c._minute_freqs[-1], 1.0)
+
+    def test_compensation_held_at_chronyd_limit(self):
+        self.c.record(210000, 2.0)                       # formula says 15 ppm
+        self.assertAlmostEqual(self.c._minute_freqs[-1], -8.0)
+
+    def test_no_compensation_while_chronyd_cannot_read_sensor(self):
+        self.c._read_failing = True
+        self.c.record(70000, 2.0)
+        self.assertAlmostEqual(self.c._minute_freqs[-1], 2.0)
+
+
+class RepairTest(unittest.TestCase):
+    """Rows recorded before CSV_FORMAT 2 hold raw + 2*comp."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.sensor = os.path.join(self.dir, "temp")
+        self.conf = os.path.join(self.dir, "chrony.conf")
+        self.now = time.time()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name, text):
+        with open(os.path.join(self.dir, name), "w") as f:
+            f.write(text)
+
+    def recal(self, *ages_days):
+        self.write("recalibrations.log", "".join(
+            time.strftime("[%Y-%m-%d %H:%M:%S] Recalibrated: x\n",
+                          time.localtime(self.now - d * 86400))
+            for d in ages_days))
+
+    def collector(self):
+        c = tempcomp.TempCompCollector(sensor_path=self.sensor,
+                                       data_dir=self.dir)
+        c._config = tempcomp.parse_chrony_tempcomp([self.conf])
+        c._load_csv()
+        return c
+
+    def rows(self, *rows):
+        self.write("tempcomp.csv", "".join(
+            f"{int(self.now - d * 86400)},{t},{f}\n" for d, t, f in rows))
+
+    def test_rows_repaired_by_the_calibration_active_when_recorded(self):
+        self.write("chrony.conf",
+                   f"tempcomp {self.sensor} 30 60000 1.0 0.0001 0.0\n")
+        self.write("chrony.conf.bak",
+                   f"tempcomp {self.sensor} 30 60000 -2.0 0.0 0.0\n")
+        self.recal(3, 1)
+        self.rows((5.0, 70000, 9.0),     # before the previous recal: unknown
+                  (2.0, 70000, 9.0),     # under .bak: comp -2
+                  (0.5, 70000, 9.0))     # under chrony.conf: comp 2
+        c = self.collector()
+        self.assertEqual(list(c._freqs), [13.0, 5.0])
+        self.assertTrue(os.path.exists(c._cal_reversed_path))
+        # Done once: the rewritten file loads as is
+        self.assertEqual(list(self.collector()._freqs), [13.0, 5.0])
+
+    def test_rows_never_compensated_are_kept(self):
+        self.write("chrony.conf",
+                   f"#tempcomp {self.sensor} 30 60000 1.0 0.0001 0.0\n")
+        self.rows((2.0, 70000, 9.0))
+        c = self.collector()
+        self.assertEqual(list(c._freqs), [9.0])
+        self.assertFalse(os.path.exists(c._cal_reversed_path))
+
+    def test_calibration_on_another_sensor_drops_its_rows(self):
+        self.write("chrony.conf", "tempcomp /elsewhere 30 60000 1.0 0.0 0.0\n")
+        self.recal(1)
+        self.rows((0.5, 70000, 9.0))
+        self.assertEqual(list(self.collector()._freqs), [])
+
+    def test_new_data_dir_needs_no_repair(self):
+        c = self.collector()
+        self.assertEqual(c._csv_format(), tempcomp.CSV_FORMAT)
 
 
 if __name__ == "__main__":

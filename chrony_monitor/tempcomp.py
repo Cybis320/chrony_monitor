@@ -39,6 +39,10 @@ CHRONY_MAX_COMP = 10.0          # ppm
 # samples at each end of the operating range; in the rare excursions past it
 # chronyd holds the compensation at about the limit.
 COMP_LIMIT_TAIL = 0.005
+
+# Version of tempcomp.csv's frequency column. Format 1 recorded rows taken while
+# tempcomp was active with its sign reversed; see _repair_reversed_sign.
+CSV_FORMAT = 2
 CONF_PATHS = ["/etc/chrony/chrony.conf", "/etc/chrony.conf"]
 
 
@@ -493,6 +497,10 @@ class TempCompCollector:
         self._last_recal_time: float = 0
         self._last_attempt_time: float = 0
         self._last_prune_time: float = 0
+        self._csv_format_path = os.path.join(data_dir, "csv_format")
+        # Present while the active calibration is one fitted with the reversed
+        # sign, i.e. known to amplify drift instead of cancelling it
+        self._cal_reversed_path = os.path.join(data_dir, "cal_reversed")
         self._cal_range_path = os.path.join(data_dir, "cal_range")
         self._cal_range: Optional[tuple] = None  # (min_C, max_C) from last calibration
         self._was_extrapolating: bool = False
@@ -661,13 +669,16 @@ class TempCompCollector:
     def record(self, temp_millideg: float, frequency_ppm: float):
         """Record a (temp, freq) pair. Called every 1s from the monitor loop.
 
-        If tempcomp is active, reconstructs the raw crystal frequency by
-        adding back the current compensation. This allows calibration data
-        collection while tempcomp is running.
+        If tempcomp is active, reconstructs the raw crystal frequency -- what
+        chronyc would report without it -- by taking the current compensation
+        back out. chronyd steers the clock by `reported - comp`, so the
+        frequency it reports with tempcomp on is `raw + comp`. This allows
+        calibration data collection while tempcomp is running.
         """
         # Reconstruct raw frequency if tempcomp is active
         raw_freq = frequency_ppm
-        if self._config and self._config.is_active:
+        # A chronyd that can't read its sensor isn't compensating at all
+        if self._config and self._config.is_active and not self._read_failing:
             # chrony's compensation is a function of *its* sensor, which may not
             # be the one we collect against (e.g. right after auto-detect moves
             # off a stuck acpitz while chrony.conf still names the old zone).
@@ -683,7 +694,7 @@ class TempCompCollector:
                 # which is about the limit since temperature crosses it slowly.
                 comp = _compute_compensation(self._config, comp_temp)
                 comp = max(-CHRONY_MAX_COMP, min(CHRONY_MAX_COMP, comp))
-                raw_freq = frequency_ppm + comp
+                raw_freq = frequency_ppm - comp
 
         self._minute_temps.append(temp_millideg)
         self._minute_freqs.append(raw_freq)
@@ -819,8 +830,13 @@ class TempCompCollector:
         # at startup, not just attempts made by this process: every apply
         # restarts chrony, and without this a monitor restart (self-update,
         # relogin) could re-apply within minutes of the previous one.
+        # The one exception is replacing a calibration known to be wrong (see
+        # _repair_reversed_sign), which needn't wait out the cooldown -- though
+        # failed attempts still do.
         now = time.time()
-        last = max(self._last_attempt_time, self._last_recal_time)
+        cal_bad = os.path.exists(self._cal_reversed_path)
+        last = max(self._last_attempt_time,
+                   0 if cal_bad else self._last_recal_time)
         if last > 0 and now - last < MIN_RECAL_INTERVAL:
             return
 
@@ -833,22 +849,25 @@ class TempCompCollector:
         if temp_range < MIN_TEMP_RANGE_FIT:
             return
 
-        # Compute new fit from raw data (outliers filtered)
+        # Compute new fit from raw data (outliers filtered). chronyd reports
+        # raw + comp, so the compensation that flattens it is the fitted raw
+        # curve negated.
         temps_md, freqs = _filter_outliers(list(self._temps), list(self._freqs))
         if len(freqs) < MIN_SAMPLES_FIT:
             return
-        new_T0, new_k0, new_k1, new_k2 = _polyfit_quadratic(temps_md, freqs)
+        new_T0, a0, a1, a2 = _polyfit_quadratic(temps_md, freqs)
+        new_k0, new_k1, new_k2 = -a0, -a1, -a2
 
         if self._config and self._config.is_active and self._config_matches_sensor():
             # Compare residual slope: current vs proposed
-            # Simulate what the residual frequency would be with each compensation
+            # Simulate the frequency chronyd would report with each compensation
             current_residuals = []
             new_residuals = []
             for t, f in zip(temps_md, freqs):
                 current_comp = _compute_compensation(self._config, t)
                 new_comp = new_k0 + new_k1 * (t - new_T0) + new_k2 * (t - new_T0) ** 2
-                current_residuals.append(f - current_comp)
-                new_residuals.append(f - new_comp)
+                current_residuals.append(f + current_comp)
+                new_residuals.append(f + new_comp)
 
             current_slope = abs(_residual_slope(temps_c, current_residuals))
             new_slope = abs(_residual_slope(temps_c, new_residuals))
@@ -864,7 +883,7 @@ class TempCompCollector:
             # against (its coefficients aren't comparable to ours, so there is
             # nothing meaningful to improve on) — check instead that the
             # quadratic fit explains enough variance
-            predicted = [new_k0 + new_k1 * (t - new_T0) + new_k2 * (t - new_T0) ** 2
+            predicted = [a0 + a1 * (t - new_T0) + a2 * (t - new_T0) ** 2
                          for t in temps_md]
             ss_res = sum((f - p) ** 2 for f, p in zip(freqs, predicted))
             mean_f = sum(freqs) / len(freqs)
@@ -955,6 +974,10 @@ class TempCompCollector:
         cal_max = max(self._temps) / 1000.0
         self._cal_range = (cal_min, cal_max)
         self._save_cal_range()
+        try:
+            os.remove(self._cal_reversed_path)
+        except OSError:
+            pass
         self._log_recal(f"Recalibrated: T0={T0:.0f} k1={k1:.6e} range={cal_min:.0f}-{cal_max:.0f}C")
 
     def _log_recal(self, msg: str):
@@ -973,20 +996,101 @@ class TempCompCollector:
         except OSError:
             pass
 
-    def _load_recal_time(self):
-        """Load the last recalibration timestamp from the log file."""
-        if not os.path.exists(self._recal_log_path):
-            return
+    def _recal_times(self) -> list:
+        """Times of the applied recalibrations in the log, oldest first."""
+        times = []
         try:
             with open(self._recal_log_path) as f:
                 for line in f:
                     if 'Recalibrated:' in line:
-                        # Extract timestamp from [YYYY-MM-DD HH:MM:SS]
+                        # Extract timestamp from [YYYY-MM-DD HH:MM:SS], which
+                        # _log_recal writes in local time
                         match = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]', line)
                         if match:
-                            import calendar
                             t = time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
-                            self._last_recal_time = calendar.timegm(t)
+                            times.append(time.mktime(t))
+        except (OSError, ValueError, OverflowError):
+            pass
+        return times
+
+    def _load_recal_time(self):
+        """Load the last recalibration timestamp from the log file."""
+        times = self._recal_times()
+        if times:
+            self._last_recal_time = times[-1]
+
+    def _repair_reversed_sign(self, rows: list) -> list:
+        """Correct rows recorded with tempcomp's sign reversed.
+
+        Before CSV_FORMAT 2, a row recorded while tempcomp was active took the
+        raw frequency as reported + comp; chronyd reports raw + comp, so the row
+        holds raw + 2*comp. Recover raw wherever the calibration chronyd was
+        applying is still known: chrony.conf's since the last logged
+        recalibration, and before that the one apply-tempcomp.sh saved to
+        chrony.conf.bak, back to the recalibration before. Older rows, and rows
+        under a calibration keyed to another sensor, are dropped.
+
+        Every calibration this monitor applied was fitted to such rows with the
+        reversed sign, so one still active is flagged for prompt replacement.
+        """
+        times = self._recal_times()
+        last_t = times[-1] if times else None
+        prev_t = times[-2] if len(times) >= 2 else None
+        cur = self._config
+        conf_path = cur.conf_path if cur and cur.conf_path else None
+        if conf_path is None:
+            conf_path = next((p for p in CONF_PATHS if os.path.exists(p)), None)
+        bak_path = conf_path + ".bak" if conf_path else None
+        bak_known = bak_path is not None and os.path.exists(bak_path)
+        bak = parse_chrony_tempcomp([bak_path]) if bak_known else None
+
+        def known(cfg):
+            # A calibration on another sensor ran off temperatures we never saw
+            return not (cfg and cfg.is_active) or sensor_identity(
+                cfg.sensor_path) == sensor_identity(self.sensor_path)
+
+        repaired, fixed, dropped = [], 0, 0
+        for ts, temp, freq in rows:
+            if last_t is None or ts >= last_t:
+                cfg, ok = cur, known(cur)
+            elif prev_t is None or ts >= prev_t:
+                cfg, ok = bak, bak_known and known(bak)
+            else:
+                cfg, ok = None, False
+            if not ok:
+                dropped += 1
+                continue
+            comp = 0.0
+            if cfg and cfg.is_active:
+                comp = _compute_compensation(cfg, temp)
+                comp = max(-CHRONY_MAX_COMP, min(CHRONY_MAX_COMP, comp))
+                fixed += 1
+            repaired.append((ts, temp, freq - 2 * comp))
+
+        if last_t is not None and cur and cur.is_active:
+            try:
+                os.makedirs(self._data_dir, exist_ok=True)
+                with open(self._cal_reversed_path, 'w'):
+                    pass
+            except OSError:
+                pass
+        if fixed or dropped:
+            self._log_recal(f"Repaired {fixed} rows recorded with tempcomp's sign "
+                            f"reversed; dropped {dropped} of unknown calibration")
+        return repaired
+
+    def _csv_format(self) -> int:
+        try:
+            with open(self._csv_format_path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return 1
+
+    def _mark_csv_format(self):
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(self._csv_format_path, 'w') as f:
+                f.write(f"{CSV_FORMAT}\n")
         except OSError:
             pass
 
@@ -1029,6 +1133,7 @@ class TempCompCollector:
     def _load_csv(self):
         """Read existing CSV into deques. Prune old entries and outliers."""
         if not os.path.exists(self._csv_path):
+            self._mark_csv_format()  # whatever is recorded now is current
             return
 
         cutoff = int(time.time()) - MAX_DATA_DAYS * 86400
@@ -1054,6 +1159,10 @@ class TempCompCollector:
         except OSError:
             return
 
+        repaired = self._csv_format() < CSV_FORMAT
+        if repaired:
+            raw_rows = self._repair_reversed_sign(raw_rows)
+
         # Filter outliers using IQR on frequency
         rows_to_keep = raw_rows
         if len(raw_rows) >= 20:
@@ -1070,9 +1179,10 @@ class TempCompCollector:
             self._temps.append(temp)
             self._freqs.append(freq)
 
-        # Rewrite file if we pruned anything
-        if len(rows_to_keep) < len(raw_rows):
-            self._rewrite_csv(rows_to_keep)
+        # Rewrite file if we repaired or pruned anything
+        if repaired or len(rows_to_keep) < len(raw_rows):
+            if self._rewrite_csv(rows_to_keep) and repaired:
+                self._mark_csv_format()
 
     def _append_csv(self, ts: int, temp: float, freq: float):
         """Append one row to the CSV file."""
@@ -1083,8 +1193,8 @@ class TempCompCollector:
         except OSError:
             pass
 
-    def _rewrite_csv(self, rows: list):
-        """Atomically rewrite the CSV file (for pruning)."""
+    def _rewrite_csv(self, rows: list) -> bool:
+        """Atomically rewrite the CSV file (for pruning). True on success."""
         tmp_path = self._csv_path + '.tmp'
         try:
             os.makedirs(self._data_dir, exist_ok=True)
@@ -1093,7 +1203,8 @@ class TempCompCollector:
                     f.write(f"{ts},{temp:.0f},{freq:.6f}\n")
             os.replace(tmp_path, self._csv_path)
         except OSError:
-            pass
+            return False
+        return True
 
 
 def _cli(argv=None) -> int:
