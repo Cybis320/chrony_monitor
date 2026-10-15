@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from chrony_monitor import tempcomp
 
@@ -136,7 +137,8 @@ class RecordTest(unittest.TestCase):
 
 
 class RepairTest(unittest.TestCase):
-    """Rows recorded before CSV_FORMAT 2 hold raw + 2*comp."""
+    """Rows recorded before CSV_FORMAT 2 hold raw + 2*comp, or raw + comp
+    while chronyd couldn't read its sensor."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -144,6 +146,12 @@ class RepairTest(unittest.TestCase):
         self.sensor = os.path.join(self.dir, "temp")
         self.conf = os.path.join(self.dir, "chrony.conf")
         self.now = time.time()
+        # The journal covers every row and chronyd never failed a read
+        self.journal = (0.0, [])
+        patcher = mock.patch.object(tempcomp, "chrony_sensor_read_failures",
+                                    side_effect=lambda since: self.journal)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -183,6 +191,33 @@ class RepairTest(unittest.TestCase):
         self.assertTrue(os.path.exists(c._cal_reversed_path))
         # Done once: the rewritten file loads as is
         self.assertEqual(list(self.collector()._freqs), [13.0, 5.0])
+
+    def test_rows_chronyd_could_not_compensate_lose_one_comp(self):
+        self.write("chrony.conf",
+                   f"tempcomp {self.sensor} 30 60000 1.0 0.0001 0.0\n")
+        self.recal(1)
+        failing = int(self.now - 0.5 * 86400)
+        self.journal = (0.0, [failing - 30, failing])
+        self.rows((0.5, 70000, 9.0),     # chronyd failing: applied nothing
+                  (0.2, 70000, 9.0))     # chronyd compensating
+        self.assertEqual(list(self.collector()._freqs), [7.0, 5.0])
+
+    def test_rows_before_the_journal_are_dropped(self):
+        self.write("chrony.conf",
+                   f"tempcomp {self.sensor} 30 60000 1.0 0.0001 0.0\n")
+        self.recal(1)
+        self.journal = (self.now - 0.3 * 86400, [])
+        self.rows((0.5, 70000, 9.0),     # older than the journal: unknown
+                  (0.2, 70000, 9.0))
+        self.assertEqual(list(self.collector()._freqs), [5.0])
+
+    def test_compensated_rows_dropped_without_a_journal(self):
+        self.write("chrony.conf",
+                   f"tempcomp {self.sensor} 30 60000 1.0 0.0001 0.0\n")
+        self.recal(1)
+        self.journal = None
+        self.rows((0.5, 70000, 9.0))
+        self.assertEqual(list(self.collector()._freqs), [])
 
     def test_rows_never_compensated_are_kept(self):
         self.write("chrony.conf",

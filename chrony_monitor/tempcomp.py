@@ -1,5 +1,6 @@
 """Temperature compensation calibration for chrony."""
 
+import bisect
 import glob
 import logging
 import math
@@ -289,6 +290,45 @@ def chrony_sensor_read_failing(since: str = "-3min") -> Optional[bool]:
     if proc.returncode != 0:
         return None
     return SENSOR_READ_ERROR in proc.stdout
+
+
+def _journal_unix_time(line: str) -> Optional[float]:
+    try:
+        return float(line.split(None, 1)[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def chrony_sensor_read_failures(since_ts: float) -> Optional[tuple]:
+    """(journal_start, failure_times) for chronyd since since_ts; None if unknown.
+
+    failure_times are when chronyd logged it couldn't read its tempcomp sensor,
+    sorted. journal_start is chronyd's oldest journal entry: before it, whether
+    chronyd was compensating can't be told.
+    """
+    units = ["-u", "chrony", "-u", "chronyd"]
+    try:
+        # Only the oldest entry is wanted; stop reading after it.
+        with subprocess.Popen(
+                ["journalctl", "-q", "--no-pager", "-o", "short-unix"] + units,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True) as head:
+            first = head.stdout.readline()
+            head.kill()
+        proc = subprocess.run(
+            ["journalctl", "-q", "--no-pager", "-o", "short-unix",
+             "--since", f"@{int(since_ts)}"] + units,
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    start = _journal_unix_time(first)
+    if proc.returncode != 0 or start is None:
+        return None
+    failures = sorted(t for t in (_journal_unix_time(line)
+                                  for line in proc.stdout.splitlines()
+                                  if SENSOR_READ_ERROR in line)
+                      if t is not None)
+    return start, failures
 
 
 def parse_chrony_tempcomp(conf_paths=None) -> Optional[TempCompConfig]:
@@ -1030,6 +1070,12 @@ class TempCompCollector:
         chrony.conf.bak, back to the recalibration before. Older rows, and rows
         under a calibration keyed to another sensor, are dropped.
 
+        A row taken while chronyd couldn't read its sensor (an AppArmor denial,
+        say) holds raw + comp instead: chronyd applied nothing, but the comp
+        was still added. The journal tells the two apart; a compensated row it
+        doesn't cover is dropped, since either guess could be off by a whole
+        comp.
+
         Every calibration this monitor applied was fitted to such rows with the
         reversed sign, so one still active is flagged for prompt replacement.
         """
@@ -1049,6 +1095,21 @@ class TempCompCollector:
             return not (cfg and cfg.is_active) or sensor_identity(
                 cfg.sensor_path) == sensor_identity(self.sensor_path)
 
+        journal = (chrony_sensor_read_failures(min(r[0] for r in rows))
+                   if rows else None)
+
+        def chronyd_compensating(ts, cfg) -> Optional[bool]:
+            if journal is None:
+                return None
+            start, failures = journal
+            # A row averages the minute before ts; chronyd logs each failed
+            # read, once per sensor interval.
+            lo, hi = ts - 60 - 2 * cfg.interval, ts + 2 * cfg.interval
+            if lo < start:
+                return None
+            i = bisect.bisect_left(failures, lo)
+            return not (i < len(failures) and failures[i] <= hi)
+
         repaired, fixed, dropped = [], 0, 0
         for ts, temp, freq in rows:
             if last_t is None or ts >= last_t:
@@ -1060,12 +1121,17 @@ class TempCompCollector:
             if not ok:
                 dropped += 1
                 continue
-            comp = 0.0
+            comp, times = 0.0, 0
             if cfg and cfg.is_active:
+                compensating = chronyd_compensating(ts, cfg)
+                if compensating is None:
+                    dropped += 1
+                    continue
                 comp = _compute_compensation(cfg, temp)
                 comp = max(-CHRONY_MAX_COMP, min(CHRONY_MAX_COMP, comp))
+                times = 2 if compensating else 1
                 fixed += 1
-            repaired.append((ts, temp, freq - 2 * comp))
+            repaired.append((ts, temp, freq - times * comp))
 
         if last_t is not None and cur and cur.is_active:
             try:
@@ -1076,7 +1142,8 @@ class TempCompCollector:
                 pass
         if fixed or dropped:
             self._log_recal(f"Repaired {fixed} rows recorded with tempcomp's sign "
-                            f"reversed; dropped {dropped} of unknown calibration")
+                            f"reversed; dropped {dropped} of unknown calibration "
+                            f"or compensation")
         return repaired
 
     def _csv_format(self) -> int:
