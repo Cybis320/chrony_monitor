@@ -34,7 +34,12 @@ OLD="$(git -C "$REPO_DIR" rev-parse HEAD)"
 # It does make the run exit non-zero at the end, so a station that has stopped
 # updating shows up as a failed unit instead of logging "up to date" forever.
 FAILED=0
-if git -C "$REPO_DIR" fetch --quiet origin "$BRANCH"; then
+if [ -n "${UPDATE_REEXEC_OLD:-}" ]; then
+    # Re-exec'd by the copy of this script that did the pull (see below): the
+    # checkout is already current, and the run is judged from where it started.
+    OLD="$UPDATE_REEXEC_OLD"
+    FAILED="${UPDATE_REEXEC_FAILED:-0}"
+elif git -C "$REPO_DIR" fetch --quiet origin "$BRANCH"; then
     git -C "$REPO_DIR" reset --hard --quiet "origin/$BRANCH"
 elif git -C "$REPO_DIR" ls-remote --exit-code --heads origin >/dev/null 2>&1 \
      && ! git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
@@ -58,6 +63,17 @@ else
 fi
 NEW="$(git -C "$REPO_DIR" rev-parse HEAD)"
 
+# The pull may have replaced this very script, but bash goes on executing the
+# copy it opened, so install steps the new commit adds would wait a whole tick.
+# Hand over to the new copy instead; it skips the fetch and inherits OLD and
+# FAILED. Only once per run: the new copy sees UPDATE_REEXEC_OLD set.
+if [ -z "${UPDATE_REEXEC_OLD:-}" ] && [ "$OLD" != "$NEW" ] \
+   && ! git -C "$REPO_DIR" diff --quiet "$OLD" "$NEW" -- scripts/update.sh; then
+    log "update.sh changed — handing over to the new version"
+    UPDATE_REEXEC_OLD="$OLD" UPDATE_REEXEC_FAILED="$FAILED" \
+        exec bash "$REPO_DIR/scripts/update.sh"
+fi
+
 if [ "$OLD" = "$NEW" ]; then
     log "Already up to date ($NEW) — verifying runtime artifacts"
 else
@@ -67,11 +83,9 @@ chmod +x "$REPO_DIR"/scripts/*.sh "$REPO_DIR"/install 2>/dev/null || true
 
 # Deliberately no early exit when OLD==NEW: every install below is gated on
 # whether the installed artifact still matches the checkout, so this run is also
-# the repair pass. It has to be, because of how this script gets updated — the
-# tick that pulls a commit is executing the PREVIOUS update.sh, so any install
-# block introduced by that commit never runs for the pull that delivered it.
-# Without a later verifying tick, the station keeps the new code with its runtime
-# pieces missing, forever.
+# the repair pass: an install that failed, or a piece someone removed, is put
+# back on the next tick. (New install steps no longer depend on it: the re-exec
+# above runs them on the tick that delivers them.)
 CHANGED="$(git -C "$REPO_DIR" diff --name-only "$OLD" "$NEW")"
 changed() { echo "$CHANGED" | grep -qx "$1"; }
 
