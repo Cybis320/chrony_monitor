@@ -136,9 +136,8 @@ class RecordTest(unittest.TestCase):
         self.assertAlmostEqual(self.c._minute_freqs[-1], 2.0)
 
 
-class RepairTest(unittest.TestCase):
-    """Rows recorded before CSV_FORMAT 2 hold raw + 2*comp, or raw + comp
-    while chronyd couldn't read its sensor."""
+class RepairFixture(unittest.TestCase):
+    """A data dir, chrony.conf and a stubbed journal for the repair tests."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -176,6 +175,12 @@ class RepairTest(unittest.TestCase):
     def rows(self, *rows):
         self.write("tempcomp.csv", "".join(
             f"{int(self.now - d * 86400)},{t},{f}\n" for d, t, f in rows))
+
+
+
+class RepairTest(RepairFixture):
+    """Rows recorded before CSV_FORMAT 2 hold raw + 2*comp, or raw + comp
+    while chronyd couldn't read its sensor."""
 
     def test_rows_repaired_by_the_calibration_active_when_recorded(self):
         self.write("chrony.conf",
@@ -236,6 +241,77 @@ class RepairTest(unittest.TestCase):
     def test_new_data_dir_needs_no_repair(self):
         c = self.collector()
         self.assertEqual(c._csv_format(), tempcomp.CSV_FORMAT)
+
+
+class UndoRepairTest(RepairFixture):
+    """Format 2 files repaired by the first version of the repair took 2*comp
+    off rows chronyd never compensated, which hold raw - comp."""
+
+    OLD_REPAIR = "Repaired 3 rows recorded with tempcomp's sign reversed; " \
+                 "dropped 0 of unknown calibration"
+    NEW_REPAIR = OLD_REPAIR + " or compensation"
+
+    def setUp(self):
+        super().setUp()
+        self.write("csv_format", "2\n")
+        # chrony.conf: comp 2 at 70000; .bak: comp -2
+        self.write("chrony.conf",
+                   f"tempcomp {self.sensor} 30 60000 1.0 0.0001 0.0\n")
+        self.write("chrony.conf.bak",
+                   f"tempcomp {self.sensor} 30 60000 -2.0 0.0 0.0\n")
+
+    def log(self, *entries):
+        self.write("recalibrations.log", "".join(
+            time.strftime("[%Y-%m-%d %H:%M:%S] ",
+                          time.localtime(self.now - d * 86400)) + msg + "\n"
+            for d, msg in entries))
+
+    def failing_at(self, *ages_days):
+        self.journal = (0.0, [int(self.now - d * 86400) for d in ages_days])
+
+    def test_uncompensated_rows_get_their_comp_back(self):
+        self.log((3, "Recalibrated: x"), (1, self.OLD_REPAIR))
+        self.failing_at(2.0, 0.5)
+        self.rows((2.0, 70000, 5.0),     # failing, under chrony.conf: +2
+                  (1.5, 70000, 5.0),     # compensating: 2*comp was right
+                  (0.5, 70000, 5.0))     # recorded after the repair
+        c = self.collector()
+        self.assertEqual(list(c._freqs), [7.0, 5.0, 5.0])
+        self.assertFalse(os.path.exists(c._cal_reversed_path))
+        self.assertEqual(c._csv_format(), tempcomp.CSV_FORMAT)
+        # Done once
+        self.assertEqual(list(self.collector()._freqs), [7.0, 5.0, 5.0])
+
+    def test_corrected_repair_is_left_alone(self):
+        self.log((3, "Recalibrated: x"), (1, self.NEW_REPAIR))
+        self.failing_at(2.0)
+        self.rows((2.0, 70000, 5.0))
+        self.assertEqual(list(self.collector()._freqs), [5.0])
+
+    def test_recalibration_since_moved_the_calibration_to_bak(self):
+        self.log((3, "Recalibrated: x"), (1, self.OLD_REPAIR),
+                 (0.8, "Recalibrated: y"))
+        self.failing_at(2.0)
+        self.rows((2.0, 70000, 5.0))     # failing, under what is now .bak: -2
+        c = self.collector()
+        self.assertEqual(list(c._freqs), [3.0])
+        # The new calibration was fitted to the uncorrected row
+        self.assertTrue(os.path.exists(c._cal_reversed_path))
+
+    def test_rows_under_a_lost_calibration_are_dropped(self):
+        self.log((3, "Recalibrated: x"), (1, self.OLD_REPAIR),
+                 (0.8, "Recalibrated: y"), (0.6, "Recalibrated: z"))
+        self.failing_at(2.0)
+        self.rows((2.0, 70000, 5.0),     # failing, calibration unknown
+                  (1.5, 70000, 5.0))     # compensating: right either way
+        self.assertEqual(list(self.collector()._freqs), [5.0])
+
+    def test_rows_dropped_without_a_journal(self):
+        self.log((3, "Recalibrated: x"), (1, self.OLD_REPAIR))
+        self.journal = None
+        self.rows((2.0, 70000, 5.0),
+                  (0.5, 70000, 5.0))     # after the repair: kept
+        self.assertEqual(list(self.collector()._freqs), [5.0])
 
 
 if __name__ == "__main__":

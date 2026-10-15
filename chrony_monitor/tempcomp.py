@@ -42,8 +42,14 @@ CHRONY_MAX_COMP = 10.0          # ppm
 COMP_LIMIT_TAIL = 0.005
 
 # Version of tempcomp.csv's frequency column. Format 1 recorded rows taken while
-# tempcomp was active with its sign reversed; see _repair_reversed_sign.
-CSV_FORMAT = 2
+# tempcomp was active with its sign reversed; see _repair_reversed_sign. Format
+# 2 files may hold that repair's first version, which over-corrected rows
+# chronyd never compensated; see _undo_uncompensated_repair.
+CSV_FORMAT = 3
+# _repair_reversed_sign's log entry; only the corrected repair ends with the end.
+REPAIR_LOG_MARKER = "rows recorded with tempcomp's sign reversed"
+REPAIR_LOG_END = "of unknown calibration or compensation"
+DEFAULT_SENSOR_INTERVAL = 30    # s, the interval _apply_calibration writes
 CONF_PATHS = ["/etc/chrony/chrony.conf", "/etc/chrony.conf"]
 
 
@@ -329,6 +335,28 @@ def chrony_sensor_read_failures(since_ts: float) -> Optional[tuple]:
                                   if SENSOR_READ_ERROR in line)
                       if t is not None)
     return start, failures
+
+
+def _chronyd_compensating(journal: Optional[tuple], ts: float,
+                          interval: float) -> Optional[bool]:
+    """Whether chronyd could read its sensor for the row ending at ts; None if
+    the journal (from chrony_sensor_read_failures) doesn't say."""
+    if journal is None:
+        return None
+    start, failures = journal
+    # A row averages the minute before ts; chronyd logs each failed read, once
+    # per sensor interval.
+    lo, hi = ts - 60 - 2 * interval, ts + 2 * interval
+    if lo < start:
+        return None
+    i = bisect.bisect_left(failures, lo)
+    return not (i < len(failures) and failures[i] <= hi)
+
+
+def _clamped_compensation(config: "TempCompConfig", temp_millideg: float) -> float:
+    # Past its limit chronyd keeps the last value it accepted, about the limit
+    comp = _compute_compensation(config, temp_millideg)
+    return max(-CHRONY_MAX_COMP, min(CHRONY_MAX_COMP, comp))
 
 
 def parse_chrony_tempcomp(conf_paths=None) -> Optional[TempCompConfig]:
@@ -1036,22 +1064,26 @@ class TempCompCollector:
         except OSError:
             pass
 
-    def _recal_times(self) -> list:
-        """Times of the applied recalibrations in the log, oldest first."""
-        times = []
+    def _log_entries(self, marker: str) -> list:
+        """(time, line) of the log entries containing marker, oldest first."""
+        entries = []
         try:
             with open(self._recal_log_path) as f:
                 for line in f:
-                    if 'Recalibrated:' in line:
+                    if marker in line:
                         # Extract timestamp from [YYYY-MM-DD HH:MM:SS], which
                         # _log_recal writes in local time
                         match = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]', line)
                         if match:
                             t = time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
-                            times.append(time.mktime(t))
+                            entries.append((time.mktime(t), line.rstrip()))
         except (OSError, ValueError, OverflowError):
             pass
-        return times
+        return entries
+
+    def _recal_times(self) -> list:
+        """Times of the applied recalibrations in the log, oldest first."""
+        return [t for t, _ in self._log_entries('Recalibrated:')]
 
     def _load_recal_time(self):
         """Load the last recalibration timestamp from the log file."""
@@ -1083,68 +1115,132 @@ class TempCompCollector:
         last_t = times[-1] if times else None
         prev_t = times[-2] if len(times) >= 2 else None
         cur = self._config
-        conf_path = cur.conf_path if cur and cur.conf_path else None
-        if conf_path is None:
-            conf_path = next((p for p in CONF_PATHS if os.path.exists(p)), None)
-        bak_path = conf_path + ".bak" if conf_path else None
-        bak_known = bak_path is not None and os.path.exists(bak_path)
-        bak = parse_chrony_tempcomp([bak_path]) if bak_known else None
-
-        def known(cfg):
-            # A calibration on another sensor ran off temperatures we never saw
-            return not (cfg and cfg.is_active) or sensor_identity(
-                cfg.sensor_path) == sensor_identity(self.sensor_path)
-
-        journal = (chrony_sensor_read_failures(min(r[0] for r in rows))
-                   if rows else None)
-
-        def chronyd_compensating(ts, cfg) -> Optional[bool]:
-            if journal is None:
-                return None
-            start, failures = journal
-            # A row averages the minute before ts; chronyd logs each failed
-            # read, once per sensor interval.
-            lo, hi = ts - 60 - 2 * cfg.interval, ts + 2 * cfg.interval
-            if lo < start:
-                return None
-            i = bisect.bisect_left(failures, lo)
-            return not (i < len(failures) and failures[i] <= hi)
+        bak, bak_known = self._bak_config()
+        journal = self._sensor_read_journal(rows)
 
         repaired, fixed, dropped = [], 0, 0
         for ts, temp, freq in rows:
             if last_t is None or ts >= last_t:
-                cfg, ok = cur, known(cur)
+                cfg, ok = cur, self._cal_known(cur)
             elif prev_t is None or ts >= prev_t:
-                cfg, ok = bak, bak_known and known(bak)
+                cfg, ok = bak, bak_known and self._cal_known(bak)
             else:
                 cfg, ok = None, False
             if not ok:
                 dropped += 1
                 continue
-            comp, times = 0.0, 0
+            comp, mult = 0.0, 0
             if cfg and cfg.is_active:
-                compensating = chronyd_compensating(ts, cfg)
+                compensating = _chronyd_compensating(journal, ts, cfg.interval)
                 if compensating is None:
                     dropped += 1
                     continue
-                comp = _compute_compensation(cfg, temp)
-                comp = max(-CHRONY_MAX_COMP, min(CHRONY_MAX_COMP, comp))
-                times = 2 if compensating else 1
+                comp = _clamped_compensation(cfg, temp)
+                mult = 2 if compensating else 1
                 fixed += 1
-            repaired.append((ts, temp, freq - times * comp))
+            repaired.append((ts, temp, freq - mult * comp))
 
         if last_t is not None and cur and cur.is_active:
-            try:
-                os.makedirs(self._data_dir, exist_ok=True)
-                with open(self._cal_reversed_path, 'w'):
-                    pass
-            except OSError:
-                pass
+            self._flag_cal_bad()
         if fixed or dropped:
-            self._log_recal(f"Repaired {fixed} rows recorded with tempcomp's sign "
-                            f"reversed; dropped {dropped} of unknown calibration "
-                            f"or compensation")
+            self._log_recal(f"Repaired {fixed} {REPAIR_LOG_MARKER}; dropped "
+                            f"{dropped} {REPAIR_LOG_END}")
         return repaired
+
+    def _undo_uncompensated_repair(self, rows: list) -> list:
+        """Give back the comp 93b132c's repair took from uncompensated rows.
+
+        That repair (the CSV_FORMAT 2 one before this was fixed) took 2*comp
+        off every row recorded under an active calibration, so a row taken
+        while chronyd couldn't read its sensor now holds raw - comp. Its log
+        entry lacks REPAIR_LOG_END, which the corrected repair writes. Rows
+        recorded after it are correct, as are rows the journal shows chronyd
+        compensating for.
+
+        The repair used chrony.conf and its .bak as they were then; a
+        recalibration since has moved the first to .bak and lost the second.
+        A row that needs its comp back under a calibration no longer known, or
+        that the journal can't vouch for, is dropped. A calibration fitted to
+        the uncorrected rows is flagged for prompt replacement.
+        """
+        repairs = self._log_entries(REPAIR_LOG_MARKER)
+        if not repairs or repairs[-1][1].endswith(REPAIR_LOG_END):
+            return rows             # nothing repaired, or repaired correctly
+        repaired_at = repairs[-1][0]
+        times = self._recal_times()
+        before = [t for t in times if t <= repaired_at]
+        since = len(times) - len(before)
+        last_t = before[-1] if before else None
+        prev_t = before[-2] if len(before) >= 2 else None
+        bak, bak_known = self._bak_config()
+        if since == 0:
+            then_cur, then_bak = (self._config, True), (bak, bak_known)
+        elif since == 1:
+            then_cur, then_bak = (bak, bak_known), (None, False)
+        else:
+            then_cur = then_bak = (None, False)
+        journal = self._sensor_read_journal([r for r in rows if r[0] < repaired_at])
+
+        out, fixed, dropped = [], 0, 0
+        for ts, temp, freq in rows:
+            if ts >= repaired_at:
+                out.append((ts, temp, freq))
+                continue
+            if last_t is None or ts >= last_t:
+                cfg, ok = then_cur
+            elif prev_t is None or ts >= prev_t:
+                cfg, ok = then_bak
+            else:
+                cfg, ok = None, False
+            if ok and not (cfg and cfg.is_active):
+                out.append((ts, temp, freq))        # nothing was taken off
+                continue
+            compensating = _chronyd_compensating(
+                journal, ts, cfg.interval if cfg else DEFAULT_SENSOR_INTERVAL)
+            if compensating:
+                out.append((ts, temp, freq))        # 2*comp was right
+                continue
+            if compensating is None or not ok:
+                dropped += 1
+                continue
+            out.append((ts, temp, freq + _clamped_compensation(cfg, temp)))
+            fixed += 1
+
+        if fixed and since:
+            self._flag_cal_bad()
+        if fixed or dropped:
+            self._log_recal(f"Restored the comp to {fixed} rows chronyd never "
+                            f"compensated; dropped {dropped} it can't account for")
+        return out
+
+    def _bak_config(self) -> tuple:
+        """(calibration in chrony.conf.bak, whether that file exists)."""
+        cur = self._config
+        conf_path = cur.conf_path if cur and cur.conf_path else None
+        if conf_path is None:
+            conf_path = next((p for p in CONF_PATHS if os.path.exists(p)), None)
+        bak_path = conf_path + ".bak" if conf_path else None
+        if bak_path is None or not os.path.exists(bak_path):
+            return None, False
+        return parse_chrony_tempcomp([bak_path]), True
+
+    def _cal_known(self, cfg) -> bool:
+        # A calibration on another sensor ran off temperatures we never saw
+        return not (cfg and cfg.is_active) or sensor_identity(
+            cfg.sensor_path) == sensor_identity(self.sensor_path)
+
+    @staticmethod
+    def _sensor_read_journal(rows: list) -> Optional[tuple]:
+        return chrony_sensor_read_failures(min(r[0] for r in rows)) if rows else None
+
+    def _flag_cal_bad(self):
+        """Mark the active calibration as fitted to bad data (see cal_reversed)."""
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(self._cal_reversed_path, 'w'):
+                pass
+        except OSError:
+            pass
 
     def _csv_format(self) -> int:
         try:
@@ -1226,9 +1322,12 @@ class TempCompCollector:
         except OSError:
             return
 
-        repaired = self._csv_format() < CSV_FORMAT
-        if repaired:
+        fmt = self._csv_format()
+        repaired = fmt < CSV_FORMAT
+        if fmt < 2:
             raw_rows = self._repair_reversed_sign(raw_rows)
+        elif repaired:
+            raw_rows = self._undo_uncompensated_repair(raw_rows)
 
         # Filter outliers using IQR on frequency
         rows_to_keep = raw_rows
