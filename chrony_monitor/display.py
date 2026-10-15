@@ -4,6 +4,7 @@ import curses
 from typing import Optional
 
 from .status import ChronyStatus, SyncState, SyncQuality
+from .serving import ServingStatus
 from .tempcomp import TempCompStatus
 
 
@@ -148,6 +149,28 @@ def format_source_line(status: ChronyStatus) -> str:
     return "No source selected"
 
 
+def format_serving_line(status: ChronyStatus, serving: ServingStatus) -> str:
+    """Format NTP service: what stratum clients get, how many, how often."""
+    if serving.allowed is None:
+        return "Unknown (chrony.conf unreadable)"
+    if not serving.allowed:
+        return "Not serving (no allow in chrony.conf)"
+    parts = []
+    # Unsynchronised, chronyd answers with leap bits that clients reject.
+    if status.selected_source is None or not status.tracking:
+        parts.append("Unsynchronised — clients will reject it")
+    else:
+        parts.append(f"Stratum {status.tracking.stratum}")
+    if serving.clients is None:
+        parts.append("clients n/a")
+    else:
+        parts.append(f"{serving.clients} client{'s' if serving.clients != 1 else ''} (15m)")
+    if serving.requests_per_hour is not None:
+        r = serving.requests_per_hour
+        parts.append(f"{r / 1000:.1f}k req/h" if r >= 1000 else f"{r:.0f} req/h")
+    return " | ".join(parts)
+
+
 def format_us(us: float) -> str:
     """Format microseconds for display."""
     if us < 1.0:
@@ -227,7 +250,8 @@ class Display:
         recovery_logs: Optional[list] = None,
         rms_history: Optional[list] = None,
         rms_duration: int = 0,
-        tempcomp_status: Optional[TempCompStatus] = None
+        tempcomp_status: Optional[TempCompStatus] = None,
+        serving_status: Optional[ServingStatus] = None
     ):
         """Render the display with current status."""
         color = get_color_for_status(status)
@@ -256,6 +280,11 @@ class Display:
         # recovery (see gps_receiver_state).
         if status.gps_configured and not status.pps_expected and status.gps_reason:
             row = self._render_section(row, w, "GPS", status.gps_reason, curses.A_DIM)
+
+        if serving_status is not None:
+            row = self._render_section(row, w, "Serving",
+                                       format_serving_line(status, serving_status),
+                                       curses.A_DIM)
 
         # TempComp section
         if tempcomp_status is not None:

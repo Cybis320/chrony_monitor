@@ -467,6 +467,8 @@ $SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl stop chrony.service
 $SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start gpsd.service
 $SUDO_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start chrony.service
 $SUDO_USER ALL=(root) NOPASSWD: /usr/local/bin/apply-tempcomp.sh
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/chronyc -n clients
+$SUDO_USER ALL=(root) NOPASSWD: /usr/bin/chronyc serverstats
 SUDOEOF
         if ! is_raspberry_pi; then
             cat >> /etc/sudoers.d/chrony-monitor << SUDOEOF

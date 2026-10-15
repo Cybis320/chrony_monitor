@@ -56,7 +56,7 @@ Both paths install:
 - Systemd services for PPS initialization
 - Udev rules for GPS/PPS devices
 - Desktop launcher and autostart (launches on login)
-- Passwordless sudo for service recovery and tempcomp recalibration
+- Passwordless sudo for service recovery, tempcomp recalibration, and the read-only `chronyc clients`/`serverstats` queries behind the Serving line
 - Daily auto-updater (`chrony-monitor-update.timer`)
 - Stable tempcomp sensor symlink service (`chrony-tempcomp-sensor.service`)
 - NTP server for the LAN: `/etc/chrony/conf.d/ntp-server.conf` allows clients

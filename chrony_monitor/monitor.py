@@ -12,6 +12,7 @@ from typing import Optional
 from .status import get_status, get_gps_info, SyncState
 from .display import Display
 from .recovery import RecoveryManager, RecoveryConfig
+from .serving import ServingTracker
 from .tempcomp import TempCompCollector, read_temperature
 
 
@@ -62,6 +63,7 @@ class Monitor:
             )
         )
         self.running = False
+        self.serving = ServingTracker()
         self._gps_cache = None
         self._gps_last_fetch = 0
         self.rms_recent = deque(maxlen=600)    # last 10 min at 1s resolution
@@ -153,7 +155,8 @@ class Monitor:
                 recovery_logs=self.recovery_manager.get_recent_logs(),
                 rms_history=rms_combined,
                 rms_duration=rms_duration,
-                tempcomp_status=tempcomp_status
+                tempcomp_status=tempcomp_status,
+                serving_status=self.serving.get()
             )
 
             # Pick up code updates pulled by the background updater by re-exec'ing.

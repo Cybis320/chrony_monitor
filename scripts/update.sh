@@ -92,6 +92,14 @@ if stale "$REPO_DIR/scripts/apply-tempcomp.sh" /usr/local/bin/apply-tempcomp.sh;
         bash "$REPO_DIR/scripts/setup-tempcomp-sudo.sh" || log "sudo setup refresh failed"
 fi
 
+# Grant the chronyc queries behind the monitor's Serving line, on stations
+# installed before it existed.
+if ! grep -qF "/usr/bin/chronyc serverstats" /etc/sudoers.d/chrony-monitor 2>/dev/null; then
+    log "chronyc sudoers rules missing — adding"
+    CHRONY_MONITOR_USER="$MONITOR_USER" \
+        bash "$REPO_DIR/scripts/setup-serving-sudo.sh" || log "chronyc sudo setup failed"
+fi
+
 # Refresh the serial-PPS init helper.
 if stale "$REPO_DIR/scripts/init-serial-pps.sh" /usr/local/bin/init-serial-pps.sh; then
     log "init-serial-pps.sh out of date — reinstalling"
