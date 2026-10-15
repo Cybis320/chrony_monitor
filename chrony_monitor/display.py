@@ -251,7 +251,8 @@ class Display:
         rms_history: Optional[list] = None,
         rms_duration: int = 0,
         tempcomp_status: Optional[TempCompStatus] = None,
-        serving_status: Optional[ServingStatus] = None
+        serving_status: Optional[ServingStatus] = None,
+        prompt: Optional[str] = None
     ):
         """Render the display with current status."""
         color = get_color_for_status(status)
@@ -323,11 +324,17 @@ class Display:
             self._render_rms_graph(rms_history, row, h - 2, w, rms_duration)
 
         # Footer instructions
-        if h > 10:
+        if h > 10 and prompt:
+            footer = prompt
+            self._addstr(h - 1, 2, footer[:w - 4], curses.A_BOLD)
+        elif h > 10:
             footer = "Ctrl+C to exit"
+            if tempcomp_status is not None:
+                footer = "r: reset TempComp | " + footer
             if status.pps_expected:
                 footer = "Auto-recovery enabled | " + footer
             self._addstr(h - 1, 2, footer, curses.A_DIM)
+        if h > 10:
             # Running commit, right-aligned; dropped if it would hit the footer
             if self.version:
                 col = w - len(self.version) - 2

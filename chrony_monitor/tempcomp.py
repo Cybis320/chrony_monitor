@@ -773,6 +773,32 @@ class TempCompCollector:
         except OSError:
             pass
 
+    def reset_data(self):
+        """Start collection over, keeping the calibration chronyd is applying.
+
+        For data that no restart or repair can vouch for: gathered across a
+        sensor switch auto-detect didn't catch, through service-restart loops,
+        or under a bug since fixed. The CSV is archived, not deleted, and the
+        tempcomp line in chrony.conf stays: chronyd keeps compensating with
+        it until auto-recalibration fits a new one to the fresh data.
+        """
+        self._archive(self._csv_path, time.strftime("reset-%Y%m%d-%H%M%S"))
+        # A missing marker reads as format 1, which would "repair" fresh rows.
+        self._mark_csv_format()
+        self._reset_reported()
+        for d in (self._temps, self._freqs, self._timestamps, self._minute_temps,
+                  self._minute_freqs, self._minute_reported, self._minute_comps):
+            d.clear()
+        self._minute_count = 0
+        self._outlier_streak = 0
+        self._last_sample_time = 0
+        self._start_time = time.time()
+        self._fit = None
+        self._fit_residual_std = 0.0
+        self._fit_time = 0
+        self._cached_correlation = None
+        self._log_recal("Data reset by operator; collecting from scratch")
+
     def record(self, temp_millideg: float, frequency_ppm: float):
         """Record a (temp, freq) pair. Called every 1s from the monitor loop.
 

@@ -35,6 +35,9 @@ def _current_head(repo_dir: str) -> Optional[str]:
     return None
 
 
+PROMPT_SECONDS = 10     # how long a key prompt or its result stays up
+
+
 @dataclass
 class MonitorConfig:
     """Configuration for the monitor."""
@@ -64,6 +67,8 @@ class Monitor:
         )
         self.running = False
         self.serving = ServingTracker()
+        self._confirm_reset_until = 0.0     # a tempcomp reset awaits 'y' until then
+        self._notice = None                 # (footer message, shown until)
         self._gps_cache = None
         self._gps_last_fetch = 0
         self.rms_recent = deque(maxlen=600)    # last 10 min at 1s resolution
@@ -156,7 +161,8 @@ class Monitor:
                 rms_history=rms_combined,
                 rms_duration=rms_duration,
                 tempcomp_status=tempcomp_status,
-                serving_status=self.serving.get()
+                serving_status=self.serving.get(),
+                prompt=self._prompt()
             )
 
             # Pick up code updates pulled by the background updater by re-exec'ing.
@@ -165,7 +171,34 @@ class Monitor:
                 self.running = False
                 break
 
-            time.sleep(self.config.interval)
+            # Wait out the interval listening for keys instead of sleeping.
+            scr.timeout(int(self.config.interval * 1000))
+            self._handle_key(scr.getch())
+
+    def _prompt(self) -> Optional[str]:
+        """Footer text that replaces the key hints: a pending question or a result."""
+        now = time.time()
+        if now < self._confirm_reset_until:
+            return "Reset TempComp data and start collecting over? y = yes, any other key = no"
+        if self._notice and now < self._notice[1]:
+            return self._notice[0]
+        return None
+
+    def _handle_key(self, key: int):
+        """'r' asks to reset tempcomp data; 'y' within PROMPT_SECONDS does it."""
+        now = time.time()
+        if now < self._confirm_reset_until:
+            if key == -1:
+                return
+            self._confirm_reset_until = 0
+            if key in (ord('y'), ord('Y')):
+                self.tempcomp.reset_data()
+                self._notice = ("TempComp data archived and reset — collecting from scratch",
+                                now + PROMPT_SECONDS)
+            else:
+                self._notice = ("TempComp reset cancelled", now + PROMPT_SECONDS)
+        elif key in (ord('r'), ord('R')) and self.tempcomp:
+            self._confirm_reset_until = now + PROMPT_SECONDS
 
     def _check_for_update(self) -> bool:
         """Return True if the git checkout has moved past our start commit."""
