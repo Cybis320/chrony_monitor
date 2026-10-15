@@ -3,9 +3,13 @@
 # Designed to be called via sudo from chrony-monitor.
 #
 # Usage: sudo apply-tempcomp.sh <proposed-conf-path>
+#        sudo apply-tempcomp.sh --disable
 #
 # The proposed file must contain exactly one tempcomp line.
 # This script validates the input, updates chrony.conf, and restarts chrony.
+# --disable comments out the active tempcomp line instead (a data reset
+# discards the fit along with the data); the next applied calibration
+# replaces the commented line and so re-enables it.
 
 set -euo pipefail
 
@@ -23,6 +27,23 @@ if [ -z "$CHRONY_CONF" ]; then
 fi
 
 PROPOSED="$1"
+
+if [ "$PROPOSED" = "--disable" ]; then
+    if ! grep -qE '^\s*tempcomp\s+' "$CHRONY_CONF"; then
+        echo "tempcomp already inactive"
+        exit 0
+    fi
+    cp "$CHRONY_CONF" "${CHRONY_CONF}.bak"
+    sed -i 's|^[[:space:]]*\(tempcomp[[:space:]]\)|#\1|' "$CHRONY_CONF"
+    if ! chronyd -p >/dev/null 2>&1; then
+        echo "Error: chrony config validation failed, restoring backup" >&2
+        cp "${CHRONY_CONF}.bak" "$CHRONY_CONF"
+        exit 1
+    fi
+    systemctl restart chrony
+    echo "Disabled tempcomp"
+    exit 0
+fi
 
 if [ ! -f "$PROPOSED" ]; then
     echo "Error: proposed file not found: $PROPOSED" >&2

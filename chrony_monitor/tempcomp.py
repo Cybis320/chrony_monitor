@@ -773,15 +773,33 @@ class TempCompCollector:
         except OSError:
             pass
 
-    def reset_data(self):
-        """Start collection over, keeping the calibration chronyd is applying.
+    def reset_data(self) -> Optional[str]:
+        """Start collection over, discarding the data and the fit made from it.
 
         For data that no restart or repair can vouch for: gathered across a
         sensor switch auto-detect didn't catch, through service-restart loops,
-        or under a bug since fixed. The CSV is archived, not deleted, and the
-        tempcomp line in chrony.conf stays: chronyd keeps compensating with
-        it until auto-recalibration fits a new one to the fresh data.
+        or under a bug since fixed. A calibration fitted to such data is just
+        as suspect, so chrony.conf's tempcomp line is commented out too;
+        auto-recalibration re-enables it with a fit to the fresh data. The CSV
+        is archived, not deleted.
+
+        Returns None, or why tempcomp couldn't be disabled (the data is reset
+        either way).
         """
+        error = None
+        if self._config and self._config.is_active:
+            error = self._run_apply_helper("--disable")
+            if error is None:
+                self._config = parse_chrony_tempcomp()
+        if error is None:
+            # The range and the reversed-sign flag describe the fit just dropped.
+            for derived in (self._cal_range_path, self._cal_reversed_path):
+                try:
+                    os.remove(derived)
+                except OSError:
+                    pass
+            self._cal_range = None
+
         self._archive(self._csv_path, time.strftime("reset-%Y%m%d-%H%M%S"))
         # A missing marker reads as format 1, which would "repair" fresh rows.
         self._mark_csv_format()
@@ -797,7 +815,11 @@ class TempCompCollector:
         self._fit_residual_std = 0.0
         self._fit_time = 0
         self._cached_correlation = None
-        self._log_recal("Data reset by operator; collecting from scratch")
+        if error:
+            self._log_recal(f"Data reset by operator; tempcomp left on: {error}")
+        else:
+            self._log_recal("Data reset by operator; tempcomp off until refitted")
+        return error
 
     def record(self, temp_millideg: float, frequency_ppm: float):
         """Record a (temp, freq) pair. Called every 1s from the monitor loop.
@@ -1009,10 +1031,12 @@ class TempCompCollector:
         # restarts chrony, and without this a monitor restart (self-update,
         # relogin) could re-apply within minutes of the previous one.
         # The one exception is replacing a calibration known to be wrong (see
-        # _repair_reversed_sign), which needn't wait out the cooldown -- though
-        # failed attempts still do.
+        # _repair_reversed_sign), or having none active at all (after a data
+        # reset), which needn't wait out the cooldown -- though failed attempts
+        # still do.
         now = time.time()
-        cal_bad = os.path.exists(self._cal_reversed_path)
+        cal_bad = (os.path.exists(self._cal_reversed_path)
+                   or not (self._config and self._config.is_active))
         last = max(self._last_attempt_time,
                    0 if cal_bad else self._last_recal_time)
         if last > 0 and now - last < MIN_RECAL_INTERVAL:
@@ -1108,36 +1132,9 @@ class TempCompCollector:
             self._log_recal(f"Failed: cannot write proposed: {e}")
             return
 
-        # Find the helper script. Prefer the root-owned installed copy: the
-        # sudoers NOPASSWD rule authorizes exactly /usr/local/bin/apply-tempcomp.sh,
-        # so `sudo -n` only succeeds for that path. The repo/source copy lives in a
-        # user-writable directory and is both unauthorized and unsafe to run as root,
-        # so it's only a last-resort fallback for dev environments without an install.
-        script = None
-        for candidate in [
-            "/usr/local/bin/apply-tempcomp.sh",
-            os.path.join(self._data_dir, "apply-tempcomp.sh"),
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "apply-tempcomp.sh"),
-        ]:
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                script = candidate
-                break
-
-        if not script:
-            self._log_recal("Failed: apply-tempcomp.sh not found")
-            return
-
-        # Apply via sudo
-        try:
-            proc = subprocess.run(
-                ["sudo", "-n", script, proposed_path],
-                capture_output=True, text=True, timeout=30
-            )
-            if proc.returncode != 0:
-                self._log_recal(f"Failed: {proc.stderr.strip()}")
-                return
-        except (subprocess.TimeoutExpired, OSError) as e:
-            self._log_recal(f"Failed: {e}")
+        error = self._run_apply_helper(proposed_path)
+        if error:
+            self._log_recal(f"Failed: {error}")
             return
 
         # Success — update in-memory config and save calibration range
@@ -1158,6 +1155,33 @@ class TempCompCollector:
         except OSError:
             pass
         self._log_recal(f"Recalibrated: T0={T0:.0f} k1={k1:.6e} range={cal_min:.0f}-{cal_max:.0f}C")
+
+    def _run_apply_helper(self, arg: str) -> Optional[str]:
+        """Run apply-tempcomp.sh <arg> as root. None on success, else why not."""
+        # Prefer the root-owned installed copy: the sudoers NOPASSWD rule
+        # authorizes exactly /usr/local/bin/apply-tempcomp.sh, so `sudo -n` only
+        # succeeds for that path. The repo/source copy lives in a user-writable
+        # directory and is both unauthorized and unsafe to run as root, so it's
+        # only a last-resort fallback for dev environments without an install.
+        script = None
+        for candidate in [
+            "/usr/local/bin/apply-tempcomp.sh",
+            os.path.join(self._data_dir, "apply-tempcomp.sh"),
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "apply-tempcomp.sh"),
+        ]:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                script = candidate
+                break
+        if not script:
+            return "apply-tempcomp.sh not found"
+        try:
+            proc = subprocess.run(["sudo", "-n", script, arg],
+                                  capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return str(e)
+        if proc.returncode != 0:
+            return proc.stderr.strip() or f"exit {proc.returncode}"
+        return None
 
     def _log_recal(self, msg: str):
         """Log a recalibration event."""

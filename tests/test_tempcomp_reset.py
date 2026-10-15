@@ -54,6 +54,52 @@ class TestResetData(unittest.TestCase):
         self.assertEqual(self.c._recal_times(), before)
         self.assertIn("reset", self.c.recal_logs[-1])
 
+    def _activate(self):
+        self.c._config = tempcomp.TempCompConfig(
+            sensor_path="/run/x", interval=30, T0=75290, k0=0.4, k1=8e-5, k2=0.0,
+            is_active=True, conf_path="/etc/chrony/chrony.conf")
+        self.c._cal_range = (65.0, 87.0)
+        self.c._save_cal_range()
+        open(self.c._cal_reversed_path, "w").close()
+
+    def test_disables_the_fit_made_from_the_data(self):
+        self._activate()
+        inactive = tempcomp.TempCompConfig(**{**vars(self.c._config), "is_active": False})
+        with mock.patch.object(self.c, "_run_apply_helper", return_value=None) as helper, \
+                mock.patch.object(tempcomp, "parse_chrony_tempcomp", return_value=inactive):
+            self.assertIsNone(self.c.reset_data())
+        helper.assert_called_once_with("--disable")
+        self.assertFalse(self.c._config.is_active)
+        self.assertIsNone(self.c._cal_range)
+        self.assertFalse(os.path.exists(self.c._cal_range_path))
+        self.assertFalse(os.path.exists(self.c._cal_reversed_path))
+
+    def test_helper_failure_resets_data_but_keeps_calibration_state(self):
+        # e.g. a station whose installed helper predates --disable
+        self._activate()
+        with mock.patch.object(self.c, "_run_apply_helper",
+                               return_value="proposed file not found: --disable"):
+            self.assertIn("--disable", self.c.reset_data())
+        self.assertTrue(self.c._config.is_active)
+        self.assertEqual(self.c._cal_range, (65.0, 87.0))
+        self.assertEqual(len(self.c._temps), 0)
+        self.assertIn("left on", self.c.recal_logs[-1])
+
+    def _passes_cooldown(self) -> bool:
+        """Does _check_recalibration get past its cooldown to the sample count?"""
+        self.c._temps = mock.MagicMock()
+        self.c._temps.__len__.return_value = 0
+        self.c._check_recalibration()
+        return self.c._temps.__len__.called
+
+    def test_no_cooldown_without_an_active_calibration(self):
+        # A recalibration logged an hour ago must not keep tempcomp off for a day.
+        self.c._last_recal_time = time.time() - 3600
+        self.assertTrue(self._passes_cooldown())
+        self._activate()
+        os.remove(self.c._cal_reversed_path)
+        self.assertFalse(self._passes_cooldown())
+
 
 class TestResetKey(unittest.TestCase):
     def _monitor(self):

@@ -179,7 +179,7 @@ class Monitor:
         """Footer text that replaces the key hints: a pending question or a result."""
         now = time.time()
         if now < self._confirm_reset_until:
-            return "Reset TempComp data and start collecting over? y = yes, any other key = no"
+            return "Reset TempComp (archive data, turn tempcomp off until refitted)? y = yes, any other key = no"
         if self._notice and now < self._notice[1]:
             return self._notice[0]
         return None
@@ -192,9 +192,10 @@ class Monitor:
                 return
             self._confirm_reset_until = 0
             if key in (ord('y'), ord('Y')):
-                self.tempcomp.reset_data()
-                self._notice = ("TempComp data archived and reset — collecting from scratch",
-                                now + PROMPT_SECONDS)
+                error = self.tempcomp.reset_data()
+                msg = ("TempComp reset: data archived, tempcomp off until refitted" if not error
+                       else f"TempComp data reset, but tempcomp is still on: {error}")
+                self._notice = (msg, now + PROMPT_SECONDS)
             else:
                 self._notice = ("TempComp reset cancelled", now + PROMPT_SECONDS)
         elif key in (ord('r'), ord('R')) and self.tempcomp:
