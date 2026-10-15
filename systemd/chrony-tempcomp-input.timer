@@ -1,0 +1,14 @@
+[Unit]
+Description=Fall back to the raw tempcomp sensor when the monitor stops smoothing it
+Documentation=https://github.com/Cybis320/chrony_monitor
+
+[Timer]
+# The monitor publishes every 5 s and the switch waits for 120 s of silence, so
+# chronyd falls back within about 2.5 min of the monitor stopping, and returns
+# to the smoothed value within 30 s of it starting.
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

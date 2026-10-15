@@ -128,6 +128,27 @@ DEFAULT_SENSOR = "/sys/class/thermal/thermal_zone0/temp"
 # concrete path.
 STABLE_SENSOR_LINK = "/run/chrony-monitor/tempcomp-sensor"
 
+# What chronyd reads. Sensors such as x86_pkg_temp step by a whole degree and
+# jump between neighbouring degrees from one second to the next; chronyd takes a
+# single reading per interval, so the compensation it applies jumps by k1 per
+# degree every interval, and the clock wanders with it. The monitor reads the
+# sensor every second and publishes a smoothed value at SMOOTHED_TEMP_PATH (in a
+# directory the boot service creates for the monitor user); a root timer
+# (update-tempcomp-input.sh) points this link at it while it is fresh, and back
+# at STABLE_SENSOR_LINK when the monitor stops publishing. Both are in the same
+# millidegrees, so one calibration serves either.
+TEMPCOMP_INPUT_LINK = "/run/chrony-monitor/tempcomp-input"
+SMOOTHED_TEMP_PATH = "/run/chrony-monitor/smoothed/temp"
+SMOOTH_TAU_S = 120              # exponential smoothing time constant
+SMOOTH_PUBLISH_S = 5            # how often the smoothed value is written
+SMOOTH_GAP_S = 60               # restart the smoothing after a gap this long
+
+# The compensation evaluated each second at what chronyd reads, its standard
+# deviation within each minute: real temperature change moves it by a few
+# thousandths of a ppm a minute, so more is sensor noise chronyd steers by.
+COMP_NOISE_WARN_PPM = 0.05
+COMP_NOISE_MINUTES = 60
+
 # Suitability ranking for crystal tempcomp; lower number = better. We want a
 # sensor that tracks board/ambient temperature (what the clock crystal sees),
 # is not stuck at a constant, and is not dominated by CPU load.
@@ -279,6 +300,10 @@ def sensor_identity(sensor_path: str, thermal_base: str = THERMAL_BASE) -> str:
     also chase the /sys/class/thermal/thermal_zoneN class symlink down into
     /sys/devices and defeat the zone-number match.
     """
+    # The smoothed value, and the link that serves it or the raw sensor, are
+    # the stable sensor's temperature
+    if sensor_path in (TEMPCOMP_INPUT_LINK, SMOOTHED_TEMP_PATH):
+        sensor_path = STABLE_SENSOR_LINK
     candidates = []
     if sensor_path:
         candidates.append(sensor_path)
@@ -556,6 +581,51 @@ def _filter_outliers(temps: list, freqs: list) -> tuple:
     return [t for t, f in filtered], [f for t, f in filtered]
 
 
+class SensorSmoother:
+    """Exponentially smoothed temperature, published for chronyd to read.
+
+    Until tau has passed since a (re)start the value is the plain mean of the
+    readings so far, so a single quantized first reading doesn't linger.
+    """
+
+    def __init__(self, path: str = SMOOTHED_TEMP_PATH, tau: float = SMOOTH_TAU_S):
+        self.path = path
+        self.tau = tau
+        self.value: Optional[float] = None
+        self._n = 0
+        self._last = 0.0
+        self._published = 0.0       # when the last write succeeded
+
+    def update(self, temp_millideg: float, now: float = None) -> float:
+        now = time.time() if now is None else now
+        if self.value is None or now - self._last > SMOOTH_GAP_S:
+            self.value, self._n = temp_millideg, 1
+        else:
+            self._n += 1
+            a = max(1.0 / self._n, 1.0 - math.exp(-(now - self._last) / self.tau))
+            self.value += a * (temp_millideg - self.value)
+        self._last = now
+        if now - self._published >= SMOOTH_PUBLISH_S:
+            self._publish(now)
+        return self.value
+
+    def _publish(self, now: float):
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(f"{self.value:.0f}\n")
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, self.path)
+            self._published = now
+        except OSError:
+            self._published = 0.0
+
+    def publishing(self, now: float = None) -> bool:
+        """True while chronyd can be reading the smoothed value."""
+        now = time.time() if now is None else now
+        return self._published > 0 and now - self._published < 3 * SMOOTH_PUBLISH_S
+
+
 class TempCompCollector:
     """Collects temperature/frequency data for tempcomp calibration."""
 
@@ -621,6 +691,27 @@ class TempCompCollector:
         # Whether chronyd itself can read the configured sensor (journal check)
         self._read_failing: Optional[bool] = None
         self._read_failing_time: float = 0
+
+        # Smoothed value for chronyd, only of the sensor the input link falls
+        # back to, and only once the boot service has made a place for it
+        self.smoother: Optional[SensorSmoother] = None
+        self._smoothable = (sensor_identity(self.sensor_path)
+                            == sensor_identity(STABLE_SENSOR_LINK))
+        # Per-minute std of the compensation at what chronyd reads
+        self._minute_chrony_comps = []
+        self._comp_noise = deque(maxlen=COMP_NOISE_MINUTES)
+
+    def read_temperature(self) -> Optional[float]:
+        """The temperature to record: the smoothed value while it's published
+        (it's what chronyd then compensates with), else the sensor's own."""
+        temp = read_temperature(self.sensor_path)
+        if (self.smoother is None and self._smoothable
+                and os.path.isdir(os.path.dirname(SMOOTHED_TEMP_PATH))):
+            self.smoother = SensorSmoother()
+        if temp is None or self.smoother is None:
+            return temp
+        smoothed = self.smoother.update(temp)
+        return smoothed if self.smoother.publishing() else temp
 
     def _update_fit(self):
         """Recompute the quadratic fit and residual std dev. Called periodically."""
@@ -805,7 +896,8 @@ class TempCompCollector:
         self._mark_csv_format()
         self._reset_reported()
         for d in (self._temps, self._freqs, self._timestamps, self._minute_temps,
-                  self._minute_freqs, self._minute_reported, self._minute_comps):
+                  self._minute_freqs, self._minute_reported, self._minute_comps,
+                  self._minute_chrony_comps, self._comp_noise):
             d.clear()
         self._minute_count = 0
         self._outlier_streak = 0
@@ -835,14 +927,15 @@ class TempCompCollector:
         comp = 0.0
         # A chronyd that can't read its sensor isn't compensating at all
         if self._config and self._config.is_active and not self._read_failing:
-            # chrony's compensation is a function of *its* sensor, which may not
-            # be the one we collect against (e.g. right after auto-detect moves
-            # off a stuck acpitz while chrony.conf still names the old zone).
-            # Evaluating the polynomial at our temperature would inject a
-            # spurious temperature-dependent term with the old k1 slope.
-            comp_temp = temp_millideg
-            if not self._config_matches_sensor():
-                comp_temp = read_temperature(self._config.sensor_path)
+            # chrony's compensation is a function of what *it* reads: the
+            # smoothed value or the raw sensor behind the input link, or another
+            # sensor altogether (e.g. right after auto-detect moves off a stuck
+            # acpitz while chrony.conf still names the old zone). Evaluating
+            # the polynomial at our temperature would inject a spurious
+            # temperature-dependent term with the old k1 slope.
+            comp_temp = read_temperature(self._config.sensor_path)
+            if comp_temp is None and self._config_matches_sensor():
+                comp_temp = temp_millideg
             # If chrony's sensor is unreadable, chrony isn't compensating
             # either, so the measured frequency is already the raw one.
             if comp_temp is not None:
@@ -851,6 +944,7 @@ class TempCompCollector:
                 comp = _compute_compensation(self._config, comp_temp)
                 comp = max(-CHRONY_MAX_COMP, min(CHRONY_MAX_COMP, comp))
                 raw_freq = frequency_ppm - comp
+                self._minute_chrony_comps.append(comp)
 
         self._minute_temps.append(temp_millideg)
         self._minute_freqs.append(raw_freq)
@@ -864,8 +958,13 @@ class TempCompCollector:
             avg_freq = sum(self._minute_freqs) / n
             avg_reported = sum(self._minute_reported) / n
             avg_comp = sum(self._minute_comps) / n
+            cc = self._minute_chrony_comps
+            if len(cc) >= 30:
+                m = sum(cc) / len(cc)
+                self._comp_noise.append(
+                    math.sqrt(sum((c - m) ** 2 for c in cc) / len(cc)))
             for bucket in (self._minute_temps, self._minute_freqs,
-                           self._minute_reported, self._minute_comps):
+                           self._minute_reported, self._minute_comps, cc):
                 bucket.clear()
             self._minute_count = 0
 
@@ -906,6 +1005,8 @@ class TempCompCollector:
         status = TempCompStatus()
 
         temp = read_temperature(self.sensor_path)
+        if self.smoother and self.smoother.publishing():
+            temp = self.smoother.value
         if temp is not None:
             status.current_temp_c = temp / 1000.0
 
@@ -981,6 +1082,15 @@ class TempCompCollector:
                     status.warning = "freq still tracks temp!"
                 elif reduction is not None and reduction < 0:
                     status.warning = "comp adds wander!"
+
+        # chronyd reads a sensor too noisy to steer by, as when it is fed the
+        # raw sensor instead of the smoothed value. Kept to the last hour, so it
+        # clears soon after the cause is fixed.
+        if (self._config and self._config.is_active and not status.warning
+                and len(self._comp_noise) >= COMP_NOISE_MINUTES // 2):
+            noise = sorted(self._comp_noise)[len(self._comp_noise) // 2]
+            if noise > COMP_NOISE_WARN_PPM:
+                status.warning = "noisy sensor, comp jitters!"
 
         # Extrapolation check with hysteresis
         if self._config and self._config.is_active and status.current_temp_c is not None:
@@ -1117,8 +1227,12 @@ class TempCompCollector:
         # isn't installed. Gate on being able to *read* it, not just on it
         # existing: writing a sensor chrony can't read silently disables
         # compensation, which is the failure this whole mechanism exists to stop.
+        # The input link serves the smoothed value, or the stable link's sensor
+        # when the monitor isn't publishing it.
         sensor = self.sensor_path
-        if read_temperature(STABLE_SENSOR_LINK) is not None:
+        if read_temperature(TEMPCOMP_INPUT_LINK) is not None:
+            sensor = TEMPCOMP_INPUT_LINK
+        elif read_temperature(STABLE_SENSOR_LINK) is not None:
             sensor = STABLE_SENSOR_LINK
         new_line = f"tempcomp {sensor} 30 {T0:.0f} {k0:.6f} {k1:.10f} {k2:.12f}"
 
@@ -1150,6 +1264,7 @@ class TempCompCollector:
         self._cal_range = (cal_min, cal_max)
         self._save_cal_range()
         self._reset_reported()  # judge the new calibration on its own minutes
+        self._comp_noise.clear()
         try:
             os.remove(self._cal_reversed_path)
         except OSError:

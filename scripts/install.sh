@@ -675,13 +675,28 @@ install_tempcomp_sensor_service() {
         warn "Could not enable chrony-tempcomp-sensor.service"
     systemctl start chrony-tempcomp-sensor.service 2>/dev/null || \
         warn "Could not start chrony-tempcomp-sensor.service"
-    # Repoint any pre-existing raw thermal_zone tempcomp path to the symlink.
-    bash "$PROJECT_DIR/scripts/migrate-tempcomp-sensor.sh" || \
-        warn "tempcomp sensor migration skipped"
+    # The input chronyd reads: the monitor's smoothed temperature while it
+    # publishes one, else the sensor above (needs update.env's MONITOR_USER,
+    # written by install_updater).
+    install -m 0755 -o root -g root \
+        "$PROJECT_DIR/scripts/update-tempcomp-input.sh" /usr/local/bin/update-tempcomp-input.sh
+    install -m 0644 -o root -g root \
+        "$PROJECT_DIR/systemd/chrony-tempcomp-input.service" \
+        "$PROJECT_DIR/systemd/chrony-tempcomp-input.timer" /etc/systemd/system/
+    systemctl daemon-reload
+    /usr/local/bin/update-tempcomp-input.sh || \
+        warn "tempcomp input link not published"
+    systemctl enable --now chrony-tempcomp-input.timer 2>/dev/null || \
+        warn "Could not enable chrony-tempcomp-input.timer"
     # Let chronyd read the node the resolver picks: the stock Debian/Ubuntu
     # AppArmor profile denies most of them, which disables tempcomp silently.
+    # Before the migration, so the chronyd it restarts can read the new input.
     bash "$PROJECT_DIR/scripts/setup-chronyd-apparmor.sh" || \
         warn "chronyd AppArmor rules not installed; tempcomp may be denied (check journalctl -u chrony)"
+    # Repoint a pre-existing raw thermal_zone or stable-link tempcomp path to
+    # the input link.
+    bash "$PROJECT_DIR/scripts/migrate-tempcomp-sensor.sh" || \
+        warn "tempcomp sensor migration skipped"
 }
 
 # Main installation

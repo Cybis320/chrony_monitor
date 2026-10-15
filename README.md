@@ -59,6 +59,7 @@ Both paths install:
 - Passwordless sudo for service recovery, tempcomp recalibration, and the read-only `chronyc clients`/`serverstats` queries behind the Serving line
 - Daily auto-updater (`chrony-monitor-update.timer`)
 - Stable tempcomp sensor symlink service (`chrony-tempcomp-sensor.service`)
+- Smoothed tempcomp input, with fallback to the sensor (`chrony-tempcomp-input.timer`)
 - NTP server for the LAN: `/etc/chrony/conf.d/ntp-server.conf` allows clients
   from private ranges (RFC 1918, IPv6 ULA/link-local), and UDP 123 in ufw if it
   is active. It lives outside `chrony.conf`, so re-provisioning keeps it, and the
@@ -104,11 +105,44 @@ To see what it picked, or to check a machine by hand:
 
 ```bash
 readlink /run/chrony-monitor/tempcomp-sensor
+readlink /run/chrony-monitor/tempcomp-input
 sudo PYTHONPATH=/usr/local/lib/chrony-monitor \
     python3 -m chrony_monitor.tempcomp --verbose
 journalctl -u chrony --since -10min | grep "Could not read temperature"   # must be empty
 sudo scripts/setup-chronyd-apparmor.sh --dry-run
 ```
+
+### Smoothed sensor input
+
+Some sensors, `x86_pkg_temp` among them, read in whole degrees and jump
+between neighbouring degrees from one second to the next. chronyd takes a
+single reading every 30 s, so fed such a sensor directly its compensation
+jumps by the calibration's slope per degree every 30 s, and the clock wanders
+with it: on one station, 0.2 ppm jumps every 30 s added microseconds to the
+RMS offset under PPS.
+
+So chronyd doesn't read the sensor itself. `chrony.conf` names
+`/run/chrony-monitor/tempcomp-input`, a link that points at either:
+
+- `/run/chrony-monitor/smoothed/temp`, which the running monitor writes every
+  5 s: the sensor read every second, exponentially smoothed over 2 minutes, in
+  the same millidegrees; or
+- `/run/chrony-monitor/tempcomp-sensor`, the sensor itself, when the smoothed
+  value is more than 2 minutes old: the monitor isn't running, or hasn't been
+  started since boot.
+
+`chrony-tempcomp-input.timer` makes that choice every 30 s, as root, and creates
+the `smoothed/` directory for the monitor user. chronyd opens the link on every
+reading, so a switch needs no restart, and one calibration serves both. The
+monitor fits its calibration against the smoothed value it publishes.
+
+```bash
+readlink /run/chrony-monitor/tempcomp-input    # .../smoothed/temp while the monitor runs
+sudo update-tempcomp-input.sh --dry-run        # what it would point at now
+```
+
+Existing stations are moved onto the link by `migrate-tempcomp-sensor.sh`,
+which keeps the coefficients.
 
 ### Is the compensation working?
 
@@ -134,6 +168,10 @@ The monitor warns when that isn't so:
   without it, as when the sensor doesn't follow the crystal's temperature.
   Neither the fit nor the slope check can see that, since both are measured
   against the same sensor.
+- `noisy sensor, comp jitters!` — the compensation at what chronyd reads moves
+  by more than 0.05 ppm within a minute (median over the last hour): chronyd is
+  steering by sensor noise, as when it reads a whole-degree sensor directly
+  because the monitor's smoothed value isn't in use.
 - `no new samples for 6h` — collection has stalled while the monitor runs.
   Minutes rejected as outliers for two hours in a row are taken as a real
   frequency step and kept, so the fit can follow it.

@@ -13,7 +13,7 @@ from .status import get_status, get_gps_info, SyncState
 from .display import Display
 from .recovery import RecoveryManager, RecoveryConfig
 from .serving import ServingTracker
-from .tempcomp import TempCompCollector, read_temperature
+from .tempcomp import TempCompCollector
 
 
 def _repo_dir() -> str:
@@ -135,7 +135,7 @@ class Monitor:
             # Record tempcomp data
             tempcomp_status = None
             if self.tempcomp and status.tracking:
-                temp = read_temperature(self.tempcomp.sensor_path)
+                temp = self.tempcomp.read_temperature()
                 if temp is not None and status.tracking.frequency_ppm != 0:
                     self.tempcomp.record(temp, status.tracking.frequency_ppm)
                 tempcomp_status = self.tempcomp.get_status()

@@ -28,11 +28,13 @@ LOCAL="${LOCAL:-/etc/apparmor.d/local/usr.sbin.chronyd}"
 BEGIN_MARK="# BEGIN chrony-monitor tempcomp (managed by setup-chronyd-apparmor.sh)"
 END_MARK="# END chrony-monitor tempcomp"
 BLOCK="$BEGIN_MARK
-# chronyd reads its tempcomp sensor through /run/chrony-monitor/tempcomp-sensor.
+# chronyd reads its tempcomp sensor through /run/chrony-monitor/tempcomp-input.
 # AppArmor checks the resolved sysfs node; allow every thermal-zone and hwmon
 # temperature node so whichever sensor the resolver picks is readable.
 @{sys}/devices/**/thermal_zone[0-9]*/temp r,
 @{sys}/devices/**/hwmon[0-9]*/temp[0-9]*_input r,
+# The monitor's smoothed temperature, served through tempcomp-input.
+/{,var/}run/chrony-monitor/smoothed/temp r,
 $END_MARK"
 
 DRY_RUN=0

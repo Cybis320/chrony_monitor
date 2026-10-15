@@ -1,0 +1,8 @@
+[Unit]
+Description=Point chronyd's tempcomp input at the smoothed temperature, or the raw sensor
+Documentation=https://github.com/Cybis320/chrony_monitor
+After=chrony-tempcomp-sensor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/update-tempcomp-input.sh

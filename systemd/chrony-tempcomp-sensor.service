@@ -15,6 +15,10 @@ Type=oneshot
 # exit means every chrony start re-runs it, which also retries a boot where the
 # thermal driver hadn't loaded yet.
 ExecStart=/usr/local/bin/update-tempcomp-symlink.sh /run/chrony-monitor/tempcomp-sensor
+# chrony.conf names tempcomp-input, which serves the monitor's smoothed value or
+# falls back to the sensor above; publish it before chrony reads it. The timer
+# keeps it current from then on.
+ExecStartPost=-/usr/local/bin/update-tempcomp-input.sh
 # The resolver waits up to 15s for a real board/SoC zone to appear.
 TimeoutStartSec=60
 

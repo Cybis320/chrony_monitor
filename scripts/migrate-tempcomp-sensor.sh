@@ -2,11 +2,13 @@
 #
 # One-time migration: repoint an existing chrony.conf tempcomp directive from a
 # raw thermal-zone node (/sys/class/thermal/thermal_zoneN/temp, or its hwmon
-# mirror thermal_zoneN/hwmonM/tempK_input) to the reboot-stable symlink
-# published by chrony-tempcomp-sensor.service.
+# mirror thermal_zoneN/hwmonM/tempK_input), or from the reboot-stable symlink
+# to it, to the input link: it serves the monitor's smoothed temperature, and
+# falls back to that stable symlink (see update-tempcomp-input.sh). Both are
+# the same sensor's temperature, so the coefficients carry over.
 #
 # Idempotent: does nothing if there's no tempcomp line, or it already uses the
-# stable link.
+# input link.
 #
 # The calibration coefficients are left in place. On the station this was written
 # for that's exactly right — the zone had renumbered under a correct fit, and
@@ -23,8 +25,10 @@
 set -u
 
 # Overridable so the migration can be exercised against a fixture config.
-LINK="${LINK:-/run/chrony-monitor/tempcomp-sensor}"
+LINK="${LINK:-/run/chrony-monitor/tempcomp-input}"
+SENSOR_LINK="${SENSOR_LINK:-/run/chrony-monitor/tempcomp-sensor}"
 RESOLVER="${RESOLVER:-/usr/local/bin/update-tempcomp-symlink.sh}"
+INPUT_SWITCH="${INPUT_SWITCH:-/usr/local/bin/update-tempcomp-input.sh}"
 
 CHRONY_CONF="${CHRONY_CONF:-}"
 if [ -z "$CHRONY_CONF" ]; then
@@ -34,8 +38,10 @@ if [ -z "$CHRONY_CONF" ]; then
 fi
 [ -z "$CHRONY_CONF" ] && { echo "migrate-tempcomp: chrony.conf not found"; exit 0; }
 
-# Only act on a tempcomp line (active or commented) that names a raw thermal zone.
-if ! grep -qE '^[[:space:]]*#?[[:space:]]*tempcomp[[:space:]]+/sys/class/thermal/thermal_zone[0-9]+/(temp|hwmon[0-9]+/temp[0-9]+_input)[[:space:]]' "$CHRONY_CONF"; then
+# Only act on a tempcomp line (active or commented) that names a raw thermal
+# zone or the stable link.
+OLD_SENSOR="(/sys/class/thermal/thermal_zone[0-9]+/(temp|hwmon[0-9]+/temp[0-9]+_input)|${SENSOR_LINK})"
+if ! grep -qE "^[[:space:]]*#?[[:space:]]*tempcomp[[:space:]]+${OLD_SENSOR}[[:space:]]" "$CHRONY_CONF"; then
     echo "migrate-tempcomp: nothing to migrate"
     exit 0
 fi
@@ -43,8 +49,11 @@ fi
 # The link must exist and be readable before chrony is pointed at it. Bail out
 # otherwise: repointing at a missing link would silently stop compensation, and
 # nothing would retry it — the next run finds no raw zone path left to migrate.
-if [ ! -e "$LINK" ] && [ -x "$RESOLVER" ]; then
-    "$RESOLVER" "$LINK" || echo "migrate-tempcomp: resolver failed" >&2
+if [ ! -e "$SENSOR_LINK" ] && [ -x "$RESOLVER" ]; then
+    "$RESOLVER" "$SENSOR_LINK" || echo "migrate-tempcomp: resolver failed" >&2
+fi
+if [ ! -e "$LINK" ] && [ -x "$INPUT_SWITCH" ]; then
+    "$INPUT_SWITCH" || echo "migrate-tempcomp: input switch failed" >&2
 fi
 if [ ! -r "$LINK" ]; then
     echo "migrate-tempcomp: $LINK not published — leaving chrony.conf alone" >&2
@@ -65,7 +74,7 @@ cp "$CHRONY_CONF" "${CHRONY_CONF}.bak.pre-sensor-migration" || {
 # keeps chrony.conf's own inode, mode and owner.
 tmp="$(mktemp)" || { echo "migrate-tempcomp: mktemp failed" >&2; exit 1; }
 if ! sed -E \
-    "s|(^[[:space:]]*#?[[:space:]]*tempcomp[[:space:]]+)/sys/class/thermal/thermal_zone[0-9]+/(temp\|hwmon[0-9]+/temp[0-9]+_input)([[:space:]])|\1${LINK}\3|" \
+    "s|(^[[:space:]]*#?[[:space:]]*tempcomp[[:space:]]+)(/sys/class/thermal/thermal_zone[0-9]+/(temp\|hwmon[0-9]+/temp[0-9]+_input)\|${SENSOR_LINK})([[:space:]])|\1${LINK}\4|" \
     "$CHRONY_CONF" > "$tmp"; then
     rm -f "$tmp"
     echo "migrate-tempcomp: rewrite failed — config untouched" >&2

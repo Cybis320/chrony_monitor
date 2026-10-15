@@ -142,15 +142,35 @@ if stale "$REPO_DIR/scripts/update-tempcomp-symlink.sh" /usr/local/bin/update-te
     systemctl start chrony-tempcomp-sensor.service 2>/dev/null || true
     RELOAD=1
 fi
-# Idempotent: repoints a stale raw-zone tempcomp path once, no-ops thereafter.
-if [ -x /usr/local/bin/update-tempcomp-symlink.sh ] && [ -f "$REPO_DIR/scripts/migrate-tempcomp-sensor.sh" ]; then
-    bash "$REPO_DIR/scripts/migrate-tempcomp-sensor.sh" || log "tempcomp sensor migration skipped"
+# The input chronyd reads (smoothed temperature, or the sensor as fallback) and
+# the timer that switches between them.
+if stale "$REPO_DIR/scripts/update-tempcomp-input.sh" /usr/local/bin/update-tempcomp-input.sh \
+   || stale "$REPO_DIR/systemd/chrony-tempcomp-input.service" /etc/systemd/system/chrony-tempcomp-input.service \
+   || stale "$REPO_DIR/systemd/chrony-tempcomp-input.timer" /etc/systemd/system/chrony-tempcomp-input.timer; then
+    log "tempcomp input switch out of date — reinstalling"
+    install -m 0755 -o root -g root \
+        "$REPO_DIR/scripts/update-tempcomp-input.sh" /usr/local/bin/update-tempcomp-input.sh || true
+    install -m 0644 -o root -g root \
+        "$REPO_DIR/systemd/chrony-tempcomp-input.service" /etc/systemd/system/chrony-tempcomp-input.service || true
+    install -m 0644 -o root -g root \
+        "$REPO_DIR/systemd/chrony-tempcomp-input.timer" /etc/systemd/system/chrony-tempcomp-input.timer || true
+    systemctl daemon-reload
+    /usr/local/bin/update-tempcomp-input.sh || true
+    systemctl enable --now chrony-tempcomp-input.timer 2>/dev/null || true
+    RELOAD=1
 fi
 # Idempotent: keeps the chronyd AppArmor allowance for the sensor node current
 # (rewrites + reloads only when the managed block differs). Without it the
 # stock Debian/Ubuntu profile denies the sensor and tempcomp is silently inert.
+# Before the migration, so the chronyd it restarts can read the new input.
 if [ -f "$REPO_DIR/scripts/setup-chronyd-apparmor.sh" ]; then
     bash "$REPO_DIR/scripts/setup-chronyd-apparmor.sh" || log "chronyd AppArmor setup failed"
+fi
+
+# Idempotent: repoints a raw-zone or stable-link tempcomp path to the input
+# link once, no-ops thereafter.
+if [ -x /usr/local/bin/update-tempcomp-symlink.sh ] && [ -f "$REPO_DIR/scripts/migrate-tempcomp-sensor.sh" ]; then
+    bash "$REPO_DIR/scripts/migrate-tempcomp-sensor.sh" || log "tempcomp sensor migration skipped"
 fi
 
 # Idempotent: keeps chronyd serving NTP to the LAN (conf.d drop-in, applied to
