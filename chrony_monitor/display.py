@@ -181,8 +181,9 @@ def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
     if tc.current_temp_c is not None:
         line1.append(f"{tc.current_temp_c:.1f}C")
 
+    # How much of the raw drift temperature explains (before correction)
     if tc.correlation is not None:
-        line1.append(f"R2={tc.correlation:.4f}")
+        line1.append(f"raw R2={tc.correlation:.2f}")
 
     if tc.warning:
         line1.append(tc.warning)
@@ -190,13 +191,22 @@ def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
     # Line 2: collection stats
     if tc.sample_count > 0:
         dur = tc.collection_duration_s
-        if dur >= 3600:
+        if dur >= 2 * 86400:
+            dur_str = f"{dur // 86400}d"    # keeps line 2 inside 80 columns
+        elif dur >= 3600:
             dur_str = f"{dur // 3600}h{(dur % 3600) // 60:02d}m"
         elif dur >= 60:
             dur_str = f"{dur // 60}m"
         else:
             dur_str = f"{dur}s"
         line2.append(f"{tc.sample_count} samples ({dur_str})")
+
+    # What chronyd reports with the correction on: a working one leaves no
+    # slope against temperature and less wander than the raw frequency
+    if tc.residual_slope is not None:
+        line2.append(f"after {tc.residual_slope:+.2f}ppm/C R2={tc.residual_r2:.2f}")
+    if tc.wander_reduction is not None:
+        line2.append(f"wander {-100 * tc.wander_reduction:+.0f}%")
 
     return " | ".join(line1), " | ".join(line2)
 

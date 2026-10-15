@@ -110,6 +110,34 @@ journalctl -u chrony --since -10min | grep "Could not read temperature"   # must
 sudo scripts/setup-chronyd-apparmor.sh --dry-run
 ```
 
+### Is the compensation working?
+
+The TempComp lines show two sides of it:
+
+- `raw R2=0.95` — how much of the crystal's drift temperature explains,
+  before correction. High means there is drift worth correcting. It is
+  computed on the raw frequency reconstructed from what chronyd reports, which
+  assumes the compensation is in effect as written, so it cannot tell you that
+  it is.
+- `after -0.01ppm/C R2=0.03 | wander -80%` — what chronyd actually reports
+  with the correction on, over the last day under the current calibration
+  (once there are 6 h of it spanning 2 °C). A working calibration leaves no
+  slope against temperature (R² near 0) and a frequency that wanders much less
+  than the raw one.
+
+The monitor warns when that isn't so:
+
+- `freq still tracks temp!` — the reported frequency still follows temperature
+  by more than half the calibration's own slope. The compensation isn't in
+  effect, has the wrong sign, or no longer fits.
+- `comp adds wander!` — the frequency wanders more with the compensation than
+  without it, as when the sensor doesn't follow the crystal's temperature.
+  Neither the fit nor the slope check can see that, since both are measured
+  against the same sensor.
+- `no new samples for 6h` — collection has stalled while the monitor runs.
+  Minutes rejected as outliers for two hours in a row are taken as a real
+  frequency step and kept, so the fit can follow it.
+
 The resolver imports a root-owned copy of the package at
 `/usr/local/lib/chrony-monitor`, refreshed by `install.sh` and `update.sh`, so a
 root service at boot never executes code from the user-writable git checkout.

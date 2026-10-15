@@ -50,6 +50,25 @@ CSV_FORMAT = 3
 REPAIR_LOG_MARKER = "rows recorded with tempcomp's sign reversed"
 REPAIR_LOG_END = "of unknown calibration or compensation"
 DEFAULT_SENSOR_INTERVAL = 30    # s, the interval _apply_calibration writes
+
+# Post-correction check, on what chronyd actually reports rather than the raw
+# frequency reconstructed from it (which assumes the compensation is in effect
+# as written, and so can't catch it not being). With a working calibration the
+# reported frequency no longer follows temperature, and wanders less than the
+# raw frequency does.
+RESIDUAL_WINDOW_S = 86400
+RESIDUAL_MIN_SAMPLES = 360      # 6 h of minute averages
+RESIDUAL_MIN_TEMP_RANGE = 2.0   # °C
+RESIDUAL_WARN_R2 = 0.5
+RESIDUAL_WARN_SHARE = 0.5       # of the calibration's own slope
+RESIDUAL_WARN_MIN_SLOPE = 0.02  # ppm/°C
+
+# No sample accepted for this long while the monitor runs: collection stalled
+STALL_WARN_S = 6 * 3600
+# Rejected as outliers for this many minutes in a row, samples are the new
+# level (a real frequency step), not outliers; refusing them would stall
+# collection for good, since the fit only moves with accepted samples.
+OUTLIER_STREAK_LIMIT = 120
 CONF_PATHS = ["/etc/chrony/chrony.conf", "/etc/chrony.conf"]
 
 
@@ -79,6 +98,12 @@ class TempCompStatus:
     cal_range: Optional[tuple] = None       # (min_C, max_C) from calibration
     last_recal: Optional[str] = None        # human-readable last recalibration
     warning: Optional[str] = None           # e.g. sensor appears stuck
+    # Post-correction metrics over the last day under the active calibration:
+    # reported frequency's slope against temperature and its R², and how much
+    # less it wanders than the raw frequency (1 - std(reported)/std(raw)).
+    residual_slope: Optional[float] = None  # ppm/°C
+    residual_r2: Optional[float] = None
+    wander_reduction: Optional[float] = None
 
 
 def read_temperature(sensor_path: str) -> Optional[float]:
@@ -550,14 +575,22 @@ class TempCompCollector:
         self._csv_path = os.path.join(data_dir, "tempcomp.csv")
         self._recal_log_path = os.path.join(data_dir, "recalibrations.log")
         self._sensor_meta_path = os.path.join(data_dir, "sensor")
+        self._reported_path = os.path.join(data_dir, "reported.csv")
 
         self._temps = deque(maxlen=MAX_SAMPLES)
         self._freqs = deque(maxlen=MAX_SAMPLES)
         self._timestamps = deque(maxlen=MAX_SAMPLES)
+        # (ts, temp, reported freq, comp chronyd applied) per minute, for the
+        # post-correction check; every minute, outliers included
+        self._reported = deque(maxlen=RESIDUAL_WINDOW_S // 60)
+        self._last_sample_time: float = 0   # last row accepted into the fit data
+        self._outlier_streak = 0
 
         # Minute bucketing
         self._minute_temps = []
         self._minute_freqs = []
+        self._minute_reported = []
+        self._minute_comps = []
         self._minute_count = 0
 
         self._config: Optional[TempCompConfig] = None
@@ -576,6 +609,8 @@ class TempCompCollector:
         # Cached correlation and fit
         self._cached_correlation: Optional[float] = None
         self._correlation_time: float = 0
+        self._cached_residual: Optional[tuple] = None
+        self._residual_time: float = 0
         self._fit: Optional[tuple] = None    # (T0, k0, k1, k2)
         self._fit_residual_std: float = 0.0  # σ of residuals
         self._fit_time: float = 0
@@ -633,6 +668,9 @@ class TempCompCollector:
         self._load_csv()
         self._load_recal_time()
         self._load_cal_range()
+        self._load_reported()
+        if self._timestamps:
+            self._last_sample_time = self._timestamps[-1]
         self._update_fit()  # build initial fit from loaded data
 
     def _config_matches_sensor(self) -> bool:
@@ -716,10 +754,11 @@ class TempCompCollector:
             # calibration range is derived data, so it's simply dropped.
             self._archive(self._csv_path, prev)
             self._archive(self._recal_log_path, prev)
-            try:
-                os.remove(self._cal_range_path)
-            except OSError:
-                pass
+            for derived in (self._cal_range_path, self._reported_path):
+                try:
+                    os.remove(derived)
+                except OSError:
+                    pass
             self._cal_range = None
             self._last_recal_time = 0
             self.recal_logs = []
@@ -745,6 +784,7 @@ class TempCompCollector:
         """
         # Reconstruct raw frequency if tempcomp is active
         raw_freq = frequency_ppm
+        comp = 0.0
         # A chronyd that can't read its sensor isn't compensating at all
         if self._config and self._config.is_active and not self._read_failing:
             # chrony's compensation is a function of *its* sensor, which may not
@@ -766,20 +806,34 @@ class TempCompCollector:
 
         self._minute_temps.append(temp_millideg)
         self._minute_freqs.append(raw_freq)
+        self._minute_reported.append(frequency_ppm)
+        self._minute_comps.append(comp)
         self._minute_count += 1
 
         if self._minute_count >= 60:
-            avg_temp = sum(self._minute_temps) / len(self._minute_temps)
-            avg_freq = sum(self._minute_freqs) / len(self._minute_freqs)
-            self._minute_temps.clear()
-            self._minute_freqs.clear()
+            n = len(self._minute_temps)
+            avg_temp = sum(self._minute_temps) / n
+            avg_freq = sum(self._minute_freqs) / n
+            avg_reported = sum(self._minute_reported) / n
+            avg_comp = sum(self._minute_comps) / n
+            for bucket in (self._minute_temps, self._minute_freqs,
+                           self._minute_reported, self._minute_comps):
+                bucket.clear()
             self._minute_count = 0
+
+            ts = int(time.time())
+            self._append_reported(ts, avg_temp, avg_reported, avg_comp)
 
             # Reject outliers based on current fit
             if self._is_outlier(avg_temp, avg_freq):
-                return
+                self._outlier_streak += 1
+                if self._outlier_streak <= OUTLIER_STREAK_LIMIT:
+                    return
+                # A lasting step: keep the samples until the fit follows it
+            else:
+                self._outlier_streak = 0
 
-            ts = int(time.time())
+            self._last_sample_time = ts
             self._temps.append(avg_temp)
             self._freqs.append(avg_freq)
             self._timestamps.append(ts)
@@ -849,6 +903,36 @@ class TempCompCollector:
                         self._cached_correlation = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0
                     self._correlation_time = now
                 status.correlation = self._cached_correlation
+
+        # Collection stalled: the monitor is running but nothing has made it
+        # into the fit data for hours (no frequency, or every minute rejected)
+        now = time.time()
+        if self._start_time and now - self._start_time > STALL_WARN_S:
+            idle = now - max(self._last_sample_time, self._start_time)
+            if idle > STALL_WARN_S:
+                status.warning = f"no new samples for {int(idle // 3600)}h"
+
+        # Post-correction check, only meaningful against chronyd's own sensor
+        if (self._config and self._config.is_active
+                and self._config_matches_sensor()):
+            if self._cached_residual is None or now - self._residual_time > 60:
+                self._cached_residual = self._residual_metrics() or ()
+                self._residual_time = now
+            if self._cached_residual:
+                slope, r2, reduction = self._cached_residual
+                status.residual_slope, status.residual_r2 = slope, r2
+                status.wander_reduction = reduction
+                # The calibration's own slope where the window sat: a working
+                # one leaves only a small share of it behind
+                mean_t = sum(r[1] for r in self._reported) / len(self._reported)
+                cfg = self._config
+                cal_slope = abs(cfg.k1 + 2 * cfg.k2 * (mean_t - cfg.T0)) * 1000.0
+                tracks = (r2 > RESIDUAL_WARN_R2 and abs(slope) > max(
+                    RESIDUAL_WARN_MIN_SLOPE, RESIDUAL_WARN_SHARE * cal_slope))
+                if tracks:
+                    status.warning = "freq still tracks temp!"
+                elif reduction is not None and reduction < 0:
+                    status.warning = "comp adds wander!"
 
         # Extrapolation check with hysteresis
         if self._config and self._config.is_active and status.current_temp_c is not None:
@@ -1042,6 +1126,7 @@ class TempCompCollector:
         cal_max = max(self._temps) / 1000.0
         self._cal_range = (cal_min, cal_max)
         self._save_cal_range()
+        self._reset_reported()  # judge the new calibration on its own minutes
         try:
             os.remove(self._cal_reversed_path)
         except OSError:
@@ -1349,6 +1434,82 @@ class TempCompCollector:
         if repaired or len(rows_to_keep) < len(raw_rows):
             if self._rewrite_csv(rows_to_keep) and repaired:
                 self._mark_csv_format()
+
+    def _append_reported(self, ts: int, temp: float, reported: float, comp: float):
+        """Record a minute of what chronyd reported, and the comp it applied."""
+        self._reported.append((ts, temp, reported, comp))
+        self._cached_residual = None
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(self._reported_path, 'a') as f:
+                f.write(f"{ts},{temp:.0f},{reported:.6f},{comp:.6f}\n")
+        except OSError:
+            pass
+        # Keep the file about a window long
+        if len(self._reported) == self._reported.maxlen and ts % 3600 < 60:
+            self._write_reported()
+
+    def _write_reported(self):
+        tmp_path = self._reported_path + '.tmp'
+        try:
+            with open(tmp_path, 'w') as f:
+                for ts, temp, reported, comp in self._reported:
+                    f.write(f"{ts},{temp:.0f},{reported:.6f},{comp:.6f}\n")
+            os.replace(tmp_path, self._reported_path)
+        except OSError:
+            pass
+
+    def _reset_reported(self):
+        self._reported.clear()
+        self._cached_residual = None
+        try:
+            os.remove(self._reported_path)
+        except OSError:
+            pass
+
+    def _load_reported(self):
+        """Load the last window of reported minutes under the active calibration."""
+        since = max(time.time() - RESIDUAL_WINDOW_S, self._last_recal_time)
+        try:
+            with open(self._reported_path) as f:
+                for line in f:
+                    parts = line.strip().split(',')
+                    if len(parts) != 4:
+                        continue
+                    try:
+                        row = (int(parts[0]), float(parts[1]),
+                               float(parts[2]), float(parts[3]))
+                    except ValueError:
+                        continue
+                    if row[0] >= since:
+                        self._reported.append(row)
+        except OSError:
+            pass
+
+    def _residual_metrics(self) -> Optional[tuple]:
+        """(slope ppm/°C, R², wander reduction) of the reported frequency over
+        the window, or None without enough of it to judge."""
+        rows = list(self._reported)
+        if len(rows) < RESIDUAL_MIN_SAMPLES:
+            return None
+        temps_c = [r[1] / 1000.0 for r in rows]
+        if max(temps_c) - min(temps_c) < RESIDUAL_MIN_TEMP_RANGE:
+            return None
+        reported = [r[2] for r in rows]
+        raw = [r[2] - r[3] for r in rows]
+        n = len(rows)
+        mt, mr = sum(temps_c) / n, sum(reported) / n
+        sxx = sum((t - mt) ** 2 for t in temps_c)
+        sxy = sum((t - mt) * (f - mr) for t, f in zip(temps_c, reported))
+        syy = sum((f - mr) ** 2 for f in reported)
+        if sxx <= 0:
+            return None
+        slope = sxy / sxx
+        r2 = (sxy * sxy) / (sxx * syy) if syy > 0 else 0.0
+        mraw = sum(raw) / n
+        sraw = math.sqrt(sum((f - mraw) ** 2 for f in raw) / n)
+        reduction = 1.0 - math.sqrt(syy / n) / sraw if sraw > 0 else None
+        return slope, r2, reduction
 
     def _append_csv(self, ts: int, temp: float, freq: float):
         """Append one row to the CSV file."""
