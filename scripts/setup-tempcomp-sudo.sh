@@ -53,16 +53,13 @@ else
 fi
 
 # 3. Verify the rule works non-interactively.
-if sudo -u "$TARGET_USER" sudo -n "$DEST" /dev/null >/dev/null 2>&1; then
+# --check succeeds without touching anything, so a failure here is sudo's. (The
+# rules grant only specific commands, so `sudo -n true` always fails, and
+# `sudo -l` reports a command that needs a password as allowed.)
+if sudo -u "$TARGET_USER" sudo -n "$DEST" --check >/dev/null 2>&1; then
     echo "Verified: $TARGET_USER can run $DEST without a password"
 else
-    # /dev/null is not a valid proposed file, so the script exits non-zero —
-    # but if sudo itself were still prompting we'd see a sudo error instead.
-    if sudo -u "$TARGET_USER" sudo -n true 2>/dev/null; then
-        echo "Verified: passwordless sudo is configured for $TARGET_USER"
-    else
-        echo "Warning: sudo -n still requires a password; check $SUDOERS" >&2
-    fi
+    echo "Warning: $TARGET_USER can't run $DEST without a password; check $SUDOERS" >&2
 fi
 
 echo "Done. Restart chrony-monitor, or apply the pending calibration now with:"

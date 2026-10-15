@@ -4,14 +4,21 @@
 #
 # Usage: sudo apply-tempcomp.sh <proposed-conf-path>
 #        sudo apply-tempcomp.sh --disable
+#        sudo apply-tempcomp.sh --check
 #
 # The proposed file must contain exactly one tempcomp line.
 # This script validates the input, updates chrony.conf, and restarts chrony.
 # --disable comments out the active tempcomp line instead (a data reset
 # discards the fit along with the data); the next applied calibration
 # replaces the commented line and so re-enables it.
+# --check does nothing and succeeds: setup-tempcomp-sudo.sh runs it to confirm
+# sudo runs this without a password.
 
 set -euo pipefail
+
+if [ "${1:-}" = "--check" ]; then
+    exit 0
+fi
 
 # Locate chrony.conf (Debian/Ubuntu use /etc/chrony/chrony.conf; others /etc/chrony.conf)
 CHRONY_CONF=""
