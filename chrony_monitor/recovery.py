@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 from .gpsd import gpsd_lines
+from .status import get_chrony_sources
 
 
 def is_raspberry_pi() -> bool:
@@ -94,6 +95,36 @@ def pps_never_pulsed(pps_dev: str, sysfs: str = PPS_SYSFS) -> bool:
     except (OSError, ValueError, IndexError):
         return False
     return True
+
+
+NTP_AGREES_MS = 100        # NTP this close to the local clock vouches for it
+WHOLE_SECOND_SLOP_MS = 250  # NMEA latency on top of the whole-second error
+
+
+def gps_whole_second_error(sources: list) -> Optional[int]:
+    """
+    Seconds by which the GPS refclocks disagree with NTP, when that error is a
+    whole number of seconds; None otherwise.
+
+    A u-blox receiver that hasn't yet decoded the GPS-UTC leap-second count
+    from the almanac (broadcast every 12.5 min) falls back to its firmware
+    default -- 16 s on a u-blox 7, against today's 18 -- and reports UTC
+    exactly that many seconds off. Chrony rightly calls GPS and GPPS
+    falsetickers, and restarting services can't help: the receiver corrects
+    itself once it hears the broadcast, and every restart only wipes chrony's
+    state. Requires a reachable NTP source agreeing with the local clock, so a
+    local clock that is itself seconds off doesn't get blamed on the GPS.
+    """
+    if not any(s.mode == '^' and s.reach != '0' and s.offset < NTP_AGREES_MS
+               for s in sources):
+        return None
+    for s in sources:
+        if s.mode != '#' or not s.is_gps or s.reach == '0':
+            continue
+        secs = round(s.offset / 1000)
+        if secs >= 1 and abs(s.offset - secs * 1000) < WHOLE_SECOND_SLOP_MS:
+            return secs
+    return None
 
 
 @dataclass
@@ -184,7 +215,8 @@ class RecoveryManager:
     def _check_reception_fault(self) -> Optional[str]:
         """
         Return a reason string when restarting services can't fix the fault:
-        the receiver has no fix, or nothing is wired to the PPS input.
+        the receiver has no fix, nothing is wired to the PPS input, or the
+        receiver's UTC is a whole number of seconds off (no leap-second data).
 
         A receiver that is talking to gpsd but has no fix has a dead antenna or
         has lost sky view. The timepulse only runs while the receiver is locked,
@@ -208,6 +240,12 @@ class RecoveryManager:
         if pps_never_pulsed(pps_dev):
             return (f"No PPS pulses on {os.path.realpath(pps_dev)} since it was "
                     f"attached — is PPS wired?; skipping service restart")
+
+        ok, sources, _ = get_chrony_sources()
+        secs = gps_whole_second_error(sources) if ok else None
+        if secs is not None:
+            return (f"GPS time off by {secs} s — receiver awaiting leap-second "
+                    f"data (clears within ~13 min of fix); skipping service restart")
 
         return None
 

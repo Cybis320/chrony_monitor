@@ -30,9 +30,23 @@ if [ ! -c "$GPS_DEV" ]; then
     exit 1
 fi
 
-# Stop gpsd so we can talk to the GPS directly (gpsd uses -b read-only mode)
+# Bring gpsd and chrony back however the script exits, so a serial error
+# under set -e doesn't leave the machine without its time sources.
+restore_services() {
+    info "Restarting gpsd..."
+    systemctl start gpsd.socket gpsd.service
+    sleep 2
+
+    info "Restarting chrony..."
+    systemctl restart chrony.service
+}
+trap restore_services EXIT
+
+# Stop gpsd so we can talk to the GPS directly (gpsd uses -b read-only mode).
+# Stop the socket too: otherwise any gpsd client (the monitor polls it) makes
+# systemd socket-activate gpsd, which reopens the port mid-configuration.
 info "Stopping gpsd..."
-systemctl stop gpsd.service 2>/dev/null || true
+systemctl stop gpsd.socket gpsd.service 2>/dev/null || true
 sleep 1
 
 info "Configuring $GPS_DEV at ${GPS_BAUD} baud..."
@@ -219,13 +233,5 @@ except serial.SerialException as e:
     print(f"Serial error: {e}", file=sys.stderr)
     sys.exit(1)
 PYEOF
-
-# Restart gpsd and chrony
-info "Restarting gpsd..."
-systemctl start gpsd.service
-sleep 2
-
-info "Restarting chrony..."
-systemctl restart chrony.service
 
 info "Done. GPS configured: Stationary mode, 15ns antenna cable delay, saved to BBR."
