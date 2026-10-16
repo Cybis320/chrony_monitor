@@ -65,10 +65,10 @@ RESIDUAL_WARN_MIN_SLOPE = 0.02  # ppm/°C
 
 # No sample accepted for this long while the monitor runs: collection stalled
 STALL_WARN_S = 6 * 3600
-# Rejected as outliers for this many minutes in a row, samples are the new
-# level (a real frequency step), not outliers; refusing them would stall
-# collection for good, since the fit only moves with accepted samples.
-OUTLIER_STREAK_LIMIT = 120
+# Minutes are kept only once chronyd's frequency estimate can be trusted again
+# after it lost its reference or restarted (it reloads the drift file and
+# re-converges; the first minute after the reset read -0.83 against -1.21 ppm).
+SETTLE_S = 600
 CONF_PATHS = ["/etc/chrony/chrony.conf", "/etc/chrony.conf"]
 
 
@@ -346,6 +346,33 @@ def chrony_sensor_read_failing(since: str = "-3min") -> Optional[bool]:
     if proc.returncode != 0:
         return None
     return SENSOR_READ_ERROR in proc.stdout
+
+
+def chronyd_age() -> Optional[float]:
+    """Seconds since the youngest chronyd process started; None if not running."""
+    try:
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        tick = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+    ages = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # comm is parenthesised and may hold spaces; fields resume after it
+        name, rest = stat[stat.find("(") + 1:stat.rfind(")")], stat[stat.rfind(")") + 2:]
+        if name == "chronyd":
+            try:
+                ages.append(uptime - int(rest.split()[19]) / tick)
+            except (ValueError, IndexError):
+                continue
+    return min(ages) if ages else None
 
 
 def _journal_unix_time(line: str) -> Optional[float]:
@@ -651,10 +678,11 @@ class TempCompCollector:
         self._freqs = deque(maxlen=MAX_SAMPLES)
         self._timestamps = deque(maxlen=MAX_SAMPLES)
         # (ts, temp, reported freq, comp chronyd applied) per minute, for the
-        # post-correction check; every minute, outliers included
+        # post-correction check; every minute chronyd was trusted
         self._reported = deque(maxlen=RESIDUAL_WINDOW_S // 60)
         self._last_sample_time: float = 0   # last row accepted into the fit data
-        self._outlier_streak = 0
+        self._settle_until: float = 0       # minutes before this are discarded
+        self._chronyd_check_time: float = 0
 
         # Minute bucketing
         self._minute_temps = []
@@ -677,14 +705,11 @@ class TempCompCollector:
         self._cal_range: Optional[tuple] = None  # (min_C, max_C) from last calibration
         self._was_extrapolating: bool = False
 
-        # Cached correlation and fit
+        # Cached correlation and post-correction check
         self._cached_correlation: Optional[float] = None
         self._correlation_time: float = 0
         self._cached_residual: Optional[tuple] = None
         self._residual_time: float = 0
-        self._fit: Optional[tuple] = None    # (T0, k0, k1, k2)
-        self._fit_residual_std: float = 0.0  # σ of residuals
-        self._fit_time: float = 0
 
         # Recalibration logs (shown in display)
         self.recal_logs: list = []
@@ -714,44 +739,6 @@ class TempCompCollector:
         smoothed = self.smoother.update(temp)
         return smoothed if self.smoother.publishing() else temp
 
-    def _update_fit(self):
-        """Recompute the quadratic fit and residual std dev. Called periodically."""
-        now = time.time()
-        if now - self._fit_time < 300:  # refit every 5 min at most
-            return
-        temps_md, freqs = _filter_outliers(list(self._temps), list(self._freqs))
-        if len(freqs) < MIN_SAMPLES_CORRELATION:
-            return
-        T0, k0, k1, k2 = _polyfit_quadratic(temps_md, freqs)
-        residuals = [f - (k0 + k1 * (t - T0) + k2 * (t - T0) ** 2)
-                     for t, f in zip(temps_md, freqs)]
-        n = len(residuals)
-        self._fit = (T0, k0, k1, k2)
-        self._fit_residual_std = math.sqrt(sum(r * r for r in residuals) / n)
-        self._fit_time = now
-
-    def _is_outlier(self, temp_millideg: float, freq_ppm: float) -> bool:
-        """Check if a sample is an outlier based on the current fit.
-
-        Only rejects within the fitted temperature range. Outside the range,
-        data is accepted to allow calibration range expansion.
-        """
-        if self._fit is None or self._fit_residual_std <= 0:
-            return False  # no fit yet, accept everything
-
-        # Don't reject data outside the fitted temperature range —
-        # the fit can't predict well there, and we need that data
-        if len(self._temps) > 0:
-            fit_min = min(self._temps)
-            fit_max = max(self._temps)
-            if temp_millideg < fit_min or temp_millideg > fit_max:
-                return False
-
-        T0, k0, k1, k2 = self._fit
-        predicted = k0 + k1 * (temp_millideg - T0) + k2 * (temp_millideg - T0) ** 2
-        residual = abs(freq_ppm - predicted)
-        return residual > 3.0 * self._fit_residual_std
-
     def load(self):
         """Load persistent data and parse chrony.conf. Call once at startup."""
         self._start_time = time.time()
@@ -763,7 +750,6 @@ class TempCompCollector:
         self._load_reported()
         if self._timestamps:
             self._last_sample_time = self._timestamps[-1]
-        self._update_fit()  # build initial fit from loaded data
 
     def _config_matches_sensor(self) -> bool:
         """True if chrony.conf's tempcomp uses the sensor we collect against.
@@ -901,12 +887,8 @@ class TempCompCollector:
                   self._minute_chrony_comps, self._comp_noise):
             d.clear()
         self._minute_count = 0
-        self._outlier_streak = 0
         self._last_sample_time = 0
         self._start_time = time.time()
-        self._fit = None
-        self._fit_residual_std = 0.0
-        self._fit_time = 0
         self._cached_correlation = None
         if error:
             self._log_recal(f"Data reset by operator; tempcomp left on: {error}")
@@ -914,8 +896,15 @@ class TempCompCollector:
             self._log_recal("Data reset by operator; tempcomp off until refitted")
         return error
 
-    def record(self, temp_millideg: float, frequency_ppm: float):
+    def record(self, temp_millideg: float, frequency_ppm: float,
+               trusted: bool = True):
         """Record a (temp, freq) pair. Called every 1s from the monitor loop.
+
+        trusted is the monitor's word that chronyd is locked to its reference
+        right now. Minutes are judged by that and by chronyd's uptime, never
+        against a fit of earlier minutes: a fit that filters its own input
+        only learns what it already believes, and once it has locked onto bad
+        data it refuses the good minutes that would correct it.
 
         If tempcomp is active, reconstructs the raw crystal frequency -- what
         chronyc would report without it -- by taking the current compensation
@@ -952,6 +941,7 @@ class TempCompCollector:
         self._minute_reported.append(frequency_ppm)
         self._minute_comps.append(comp)
         now = time.time()
+        self._check_settled(now, trusted)
         if self._minute_count == 0:
             self._minute_start = now
         self._minute_count += 1
@@ -975,18 +965,13 @@ class TempCompCollector:
                 bucket.clear()
             self._minute_count = 0
 
+            # Any untrusted second in the minute extends the settle window
+            # past its end, so this drops that minute too.
+            if now <= self._settle_until:
+                return
+
             ts = int(now)
             self._append_reported(ts, avg_temp, avg_reported, avg_comp)
-
-            # Reject outliers based on current fit
-            if self._is_outlier(avg_temp, avg_freq):
-                self._outlier_streak += 1
-                if self._outlier_streak <= OUTLIER_STREAK_LIMIT:
-                    return
-                # A lasting step: keep the samples until the fit follows it
-            else:
-                self._outlier_streak = 0
-
             self._last_sample_time = ts
             self._temps.append(avg_temp)
             self._freqs.append(avg_freq)
@@ -994,7 +979,6 @@ class TempCompCollector:
 
             self._append_csv(ts, avg_temp, avg_freq)
             self._cached_correlation = None
-            self._update_fit()
 
             # Prune CSV daily to match deque contents
             now = time.time()
@@ -1061,7 +1045,7 @@ class TempCompCollector:
                 status.correlation = self._cached_correlation
 
         # Collection stalled: the monitor is running but nothing has made it
-        # into the fit data for hours (no frequency, or every minute rejected)
+        # into the fit data for hours (no frequency, or never locked long enough)
         now = time.time()
         if self._start_time and now - self._start_time > STALL_WARN_S:
             idle = now - max(self._last_sample_time, self._start_time)
@@ -1139,6 +1123,16 @@ class TempCompCollector:
                 status.last_recal = f"{ago // 86400}d ago"
 
         return status
+
+    def _check_settled(self, now: float, trusted: bool):
+        """Push the settle window out after lost lock or a chronyd (re)start."""
+        if not trusted:
+            self._settle_until = max(self._settle_until, now + SETTLE_S)
+        if now - self._chronyd_check_time >= 30:
+            self._chronyd_check_time = now
+            age = chronyd_age()
+            if age is not None and age < SETTLE_S:
+                self._settle_until = max(self._settle_until, now - age + SETTLE_S)
 
     def _check_recalibration(self):
         """Check if recalibration is warranted and apply if so."""

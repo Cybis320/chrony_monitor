@@ -36,6 +36,22 @@ def _current_head(repo_dir: str) -> Optional[str]:
 
 
 PROMPT_SECONDS = 10     # how long a key prompt or its result stays up
+TEMPCOMP_MAX_SKEW_PPM = 0.5   # chronyd's own frequency error bound; ~0.04 locked
+
+
+def tempcomp_trusted(status, recovering: bool) -> bool:
+    """Is chronyd's frequency estimate fit to calibrate tempcomp against?
+
+    Locked to the reference the station is meant to have (GPPS where PPS is
+    expected, else any sync), not mid-recovery, and confident in its estimate.
+    """
+    from .status import SyncQuality
+    locked = (status.sync_state == SyncState.GPPS_LOCKED if status.pps_expected
+              else status.sync_state in (SyncState.GPPS_LOCKED, SyncState.NTP_SYNCED))
+    return (locked and not recovering
+            and status.sync_quality not in (SyncQuality.DEGRADED, SyncQuality.NONE)
+            and status.tracking is not None
+            and status.tracking.skew_ppm <= TEMPCOMP_MAX_SKEW_PPM)
 
 
 @dataclass
@@ -137,7 +153,10 @@ class Monitor:
             if self.tempcomp and status.tracking:
                 temp = self.tempcomp.read_temperature()
                 if temp is not None and status.tracking.frequency_ppm != 0:
-                    self.tempcomp.record(temp, status.tracking.frequency_ppm)
+                    self.tempcomp.record(
+                        temp, status.tracking.frequency_ppm,
+                        trusted=tempcomp_trusted(
+                            status, self.recovery_manager.is_recovering))
                 tempcomp_status = self.tempcomp.get_status()
 
             # Handle recovery logic for PPS mode

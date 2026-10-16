@@ -6,7 +6,10 @@ import time
 import unittest
 from unittest import mock
 
-from chrony_monitor import display, tempcomp
+from types import SimpleNamespace
+
+from chrony_monitor import display, monitor, tempcomp
+from chrony_monitor.status import SyncQuality, SyncState
 
 T0 = 40000
 RAW_SLOPE = -0.2e-3                     # ppm per millidegree: -0.2 ppm/°C
@@ -141,21 +144,65 @@ class StallTest(unittest.TestCase):
         self.c._last_sample_time = time.time() - 600
         self.assertIsNone(self.c.get_status().warning)
 
-    def test_lasting_step_is_followed_not_rejected(self):
-        # A tight fit at 3 ppm; the frequency then steps to 6 ppm for good
-        for i in range(400):
-            self.c._temps.append(T0 + 100 * (i % 20))
-            self.c._freqs.append(3.0 + 0.001 * (i % 3))
-            self.c._timestamps.append(i)
-        self.c._fit = (T0, 3.0, 0.0, 0.0)
-        self.c._fit_residual_std = 0.001
-        self.c._fit_time = time.time()          # don't refit during the test
-        before = len(self.c._temps)
-        minutes = tempcomp.OUTLIER_STREAK_LIMIT + 5
+    def feed(self, minutes, freq=3.0, trusted=True):
         for _ in range(minutes * 60):
-            self.c.record(T0 + 500, 6.0)
-        self.assertEqual(len(self.c._temps) - before, 5)
-        self.assertEqual(len(self.c._reported), minutes)
+            self.c.record(T0, freq, trusted=trusted)
+            self.clock[0] += 1.0
+
+    def _clock(self):
+        self.clock = [1790000000.0]
+        patcher = mock.patch.object(tempcomp.time, "time", lambda: self.clock[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_step_is_kept_from_its_first_minute(self):
+        # No fit gets to veto a minute: a real step in frequency is data.
+        self._clock()
+        self.feed(400)
+        self.feed(5, freq=6.0)
+        self.assertEqual(len(self.c._temps), 405)
+        self.assertEqual(list(self.c._freqs)[-5:], [6.0] * 5)
+
+    def test_lost_lock_drops_minutes_until_settled(self):
+        self._clock()
+        self.feed(10)
+        self.feed(1, trusted=False)
+        self.feed(20)
+        # the untrusted minute and the SETTLE_S after it are dropped
+        self.assertEqual(len(self.c._temps), 10 + 20 - tempcomp.SETTLE_S // 60)
+        self.assertEqual(len(self.c._reported), len(self.c._temps))
+
+    def test_chronyd_restart_drops_minutes_until_settled(self):
+        self._clock()
+        started = self.clock[0]
+        with mock.patch.object(tempcomp, "chronyd_age",
+                               lambda: self.clock[0] - started):
+            self.feed(20)
+        self.assertEqual(len(self.c._temps), 20 - tempcomp.SETTLE_S // 60)
+
+
+class TrustedTest(unittest.TestCase):
+    def status(self, state=SyncState.GPPS_LOCKED, pps=True, skew=0.04,
+               quality=SyncQuality.EXCELLENT):
+        return SimpleNamespace(sync_state=state, pps_expected=pps, sync_quality=quality,
+                               tracking=SimpleNamespace(skew_ppm=skew))
+
+    def test_locked(self):
+        self.assertTrue(monitor.tempcomp_trusted(self.status(), False))
+
+    def test_pps_station_on_ntp_fallback_is_not(self):
+        self.assertFalse(monitor.tempcomp_trusted(
+            self.status(SyncState.NTP_SYNCED), False))
+
+    def test_ntp_only_station_on_ntp_is(self):
+        self.assertTrue(monitor.tempcomp_trusted(
+            self.status(SyncState.NTP_SYNCED, pps=False), False))
+
+    def test_recovering_or_unsure_is_not(self):
+        self.assertFalse(monitor.tempcomp_trusted(self.status(), True))
+        self.assertFalse(monitor.tempcomp_trusted(self.status(skew=2.0), False))
+        self.assertFalse(monitor.tempcomp_trusted(
+            self.status(quality=SyncQuality.DEGRADED), False))
 
 
 if __name__ == "__main__":

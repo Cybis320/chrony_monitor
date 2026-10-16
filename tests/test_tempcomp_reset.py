@@ -26,7 +26,6 @@ class TestResetData(unittest.TestCase):
         self.c._append_reported(1790006000, 75000, -0.8, 0.3)
         self.c._minute_temps.append(75000)
         self.c._minute_count = 1
-        self.c._fit = (75000, -11.0, 0.0, 0.0)
         self.c._cached_correlation = 0.61
 
     def test_archives_csv_and_starts_clean(self):
@@ -39,7 +38,6 @@ class TestResetData(unittest.TestCase):
         self.assertFalse(os.path.exists(self.c._reported_path))
         self.assertEqual(len(self.c._temps), 0)
         self.assertEqual(self.c._minute_count, 0)
-        self.assertIsNone(self.c._fit)
         self.assertIsNone(self.c.get_status().correlation)
 
     def test_fresh_rows_are_not_repaired_on_next_load(self):
