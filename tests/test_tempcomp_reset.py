@@ -101,6 +101,21 @@ class TestResetData(unittest.TestCase):
         self.assertFalse(self._passes_cooldown())
 
 
+class TestMinuteSamples(unittest.TestCase):
+    def test_a_slow_loop_still_samples_once_a_minute(self):
+        # The monitor loop runs ~1.3 s per pass; 60 passes must not make a
+        # "minute" sample, or MIN_SAMPLES_FIT's 6 hours stretches to 8.
+        with tempfile.TemporaryDirectory() as tmp:
+            c = tempcomp.TempCompCollector(sensor_path=os.path.join(tmp, "temp"),
+                                           data_dir=tmp, auto_recal=False)
+            clock = [1790000000.0]
+            with mock.patch.object(tempcomp.time, "time", lambda: clock[0]):
+                for _ in range(10 * 47):        # 10 min at 1.3 s per pass
+                    c.record(70000, -1.0)
+                    clock[0] += 1.3
+            self.assertIn(len(c._temps), (9, 10))
+
+
 class TestResetKey(unittest.TestCase):
     def _monitor(self):
         m = monitor.Monitor.__new__(monitor.Monitor)

@@ -662,6 +662,7 @@ class TempCompCollector:
         self._minute_reported = []
         self._minute_comps = []
         self._minute_count = 0
+        self._minute_start: float = 0
 
         self._config: Optional[TempCompConfig] = None
         self._start_time: float = 0
@@ -950,9 +951,15 @@ class TempCompCollector:
         self._minute_freqs.append(raw_freq)
         self._minute_reported.append(frequency_ppm)
         self._minute_comps.append(comp)
+        now = time.time()
+        if self._minute_count == 0:
+            self._minute_start = now
         self._minute_count += 1
 
-        if self._minute_count >= 60:
+        # A minute of wall clock, not 60 calls: the monitor loop takes more
+        # than its 1 s interval (chronyc calls), so 60 calls ran ~77 s and
+        # "6 hours" of samples took nearly 8.
+        if self._minute_count >= 60 or now - self._minute_start >= 60:
             n = len(self._minute_temps)
             avg_temp = sum(self._minute_temps) / n
             avg_freq = sum(self._minute_freqs) / n
@@ -968,7 +975,7 @@ class TempCompCollector:
                 bucket.clear()
             self._minute_count = 0
 
-            ts = int(time.time())
+            ts = int(now)
             self._append_reported(ts, avg_temp, avg_reported, avg_comp)
 
             # Reject outliers based on current fit
