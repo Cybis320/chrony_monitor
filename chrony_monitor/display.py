@@ -231,6 +231,17 @@ def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
     if tc.wander_reduction is not None:
         line2.append(f"wander {-100 * tc.wander_reduction:+.0f}%")
 
+    # Which sensor: still being learned (first, so a long line doesn't clip
+    # it), or the one chosen
+    if tc.learning_s is not None:
+        best = ""
+        if tc.learning_best:
+            label, tau, r2 = tc.learning_best
+            best = f": best {label} {tau:g}m R2={r2:.2f}"
+        line2.insert(0, f"learning {tc.learning_s // 3600}h{best}")
+    elif tc.sensor_choice:
+        line2.append(f"{tc.sensor_choice[0]} {tc.sensor_choice[1]:g}m")
+
     return " | ".join(line1), " | ".join(line2)
 
 

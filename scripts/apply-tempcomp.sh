@@ -5,6 +5,7 @@
 # Usage: sudo apply-tempcomp.sh <proposed-conf-path>
 #        sudo apply-tempcomp.sh --disable
 #        sudo apply-tempcomp.sh --check
+#        sudo apply-tempcomp.sh --sensor <sensor identity>
 #
 # The proposed file must contain exactly one tempcomp line.
 # This script validates the input, updates chrony.conf, and restarts chrony.
@@ -13,10 +14,37 @@
 # replaces the commented line and so re-enables it.
 # --check does nothing and succeeds: setup-tempcomp-sudo.sh runs it to confirm
 # sudo runs this without a password.
+# --sensor pins the sensor the monitor's learning phase chose (an identity such
+# as 'hwmon:coretemp.1:Core 3', as `python3 -m chrony_monitor.tempcomp --list`
+# prints them) and re-resolves the stable sensor link, which the boot-time
+# resolver points at the pinned sensor ahead of its type ranking.
 
 set -euo pipefail
 
 if [ "${1:-}" = "--check" ]; then
+    exit 0
+fi
+
+if [ "${1:-}" = "--sensor" ]; then
+    SENSOR_ID="${2:-}"
+    PIN="/etc/chrony-monitor/tempcomp-sensor"
+    # An identity is a name, never a path: the resolver looks it up among the
+    # sensors it finds, so all that can go wrong is a name that matches none
+    if [[ "$SENSOR_ID" == *$'\n'* ]] \
+       || ! printf '%s' "$SENSOR_ID" | grep -qxE '(type|hwmon):[A-Za-z0-9 _.:#()+-]{1,96}'; then
+        echo "Error: invalid sensor identity" >&2
+        exit 1
+    fi
+    install -d -m 0755 "$(dirname "$PIN")"
+    TMP="$(mktemp "$PIN.XXXXXX")"
+    printf '%s\n' "$SENSOR_ID" > "$TMP"
+    chmod 0644 "$TMP"
+    mv -f "$TMP" "$PIN"
+    if ! /usr/local/bin/update-tempcomp-symlink.sh /run/chrony-monitor/tempcomp-sensor; then
+        echo "Error: could not re-resolve the sensor link" >&2
+        exit 1
+    fi
+    echo "Pinned sensor: $SENSOR_ID"
     exit 0
 fi
 

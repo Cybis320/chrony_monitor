@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -71,6 +72,25 @@ STALL_WARN_S = 6 * 3600
 SETTLE_S = 600
 CONF_PATHS = ["/etc/chrony/chrony.conf", "/etc/chrony.conf"]
 
+# Learning phase. Which sensor tracks the crystal depends on the board (on a
+# dual-socket Z840 one package sensor explained the drift and the other, of
+# the same type, didn't), so the type ranking only picks where to start. Until
+# a sensor is chosen, every candidate is logged beside the raw frequency each
+# minute; once there is enough evidence the one, and the smoothing, that best
+# predicts held-out data is chosen and kept until a data reset.
+LEARN_TAUS_MIN = (2, 5, 10, 20, 40, 80)  # smoothing to try; 2 min is the floor
+LEARN_MIN_S = 48 * 3600         # learn for at least this long
+LEARN_MIN_MINUTES = 1440        # and on at least this many trusted minutes
+LEARN_WINDOW_S = 7 * 86400      # keep learning on the last week until decided
+LEARN_TRAIN_SHARE = 0.6         # fit on the older share, score on the rest
+LEARN_MIN_TEST_R2 = 0.5         # the winner must explain this much, held out
+LEARN_MIN_TEST_RANGE = 2.0      # °C, over the held-out minutes
+LEARN_KEEP_MARGIN = 0.03        # keep the sensor in use unless beaten by this
+LEARN_SCORE_S = 3600            # how often to score
+LEARN_SCORE_FROM_S = 12 * 3600  # interim scores for the display from here
+LEARN_GAP_S = 600               # restart the smoothing across a gap this long
+LEARN_MIN_COVERAGE = 0.95       # a sensor must have read in this share of minutes
+
 
 @dataclass
 class TempCompConfig:
@@ -104,6 +124,11 @@ class TempCompStatus:
     residual_slope: Optional[float] = None  # ppm/°C
     residual_r2: Optional[float] = None
     wander_reduction: Optional[float] = None
+    # Learning phase: how long so far, and the best sensor yet (label, tau
+    # minutes, held-out R²); or the choice it made
+    learning_s: Optional[int] = None
+    learning_best: Optional[tuple] = None
+    sensor_choice: Optional[tuple] = None   # (label, tau minutes)
 
 
 def read_temperature(sensor_path: str) -> Optional[float]:
@@ -116,7 +141,13 @@ def read_temperature(sensor_path: str) -> Optional[float]:
 
 
 THERMAL_BASE = "/sys/class/thermal"
+HWMON_BASE = "/sys/class/hwmon"
 DEFAULT_SENSOR = "/sys/class/thermal/thermal_zone0/temp"
+
+# The sensor the learning phase chose, by sensor_identity(); root-owned, written
+# by apply-tempcomp.sh --sensor, and honored by the boot-time resolver ahead of
+# the type ranking.
+SENSOR_PIN_PATH = "/etc/chrony-monitor/tempcomp-sensor"
 
 # Stable, reboot-proof alias for the tempcomp sensor. Thermal-zone indices
 # renumber across kernel updates, so a raw thermal_zoneN path baked into
@@ -319,10 +350,118 @@ def sensor_identity(sensor_path: str, thermal_base: str = THERMAL_BASE) -> str:
     for cand in candidates:
         zone_dir = _zone_dir_of(cand, thermal_base)
         if zone_dir:
-            ztype = _read_zone_type(zone_dir)
-            if ztype:
-                return "type:" + ztype
+            ident = _zone_identity(zone_dir)
+            if ident:
+                return ident
+    for cand in candidates:
+        ident = _hwmon_identity(cand)
+        if ident:
+            return ident
     return "path:" + (sensor_path or "")
+
+
+def _zone_number(name: str) -> int:
+    m = re.search(r'(\d+)$', name)
+    return int(m.group(1)) if m else -1
+
+
+def _zone_identity(zone_dir: str) -> str:
+    """'type:<zone type>', with '#k' for the k-th later zone of the same type.
+
+    The first zone of a type keeps the bare type, as identities always were;
+    a second one (each socket of a dual-socket machine has an x86_pkg_temp)
+    must not pass for it.
+    """
+    ztype = _read_zone_type(zone_dir)
+    if not ztype:
+        return ""
+    base = os.path.dirname(zone_dir)
+    try:
+        same = sorted((z for z in os.listdir(base) if z.startswith("thermal_zone")
+                       and _read_zone_type(os.path.join(base, z)) == ztype),
+                      key=_zone_number)
+    except OSError:
+        same = []
+    k = same.index(os.path.basename(zone_dir)) if os.path.basename(zone_dir) in same else 0
+    return f"type:{ztype}#{k}" if k else "type:" + ztype
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _hwmon_identity(path: str) -> str:
+    """'hwmon:<device>:<label>' for an hwmon temperature node, or ''.
+
+    hwmonN renumbers across boots, so key on the device it belongs to (e.g.
+    coretemp.1, one per socket) and the channel's label (e.g. 'Core 3').
+    """
+    m = re.search(r'/temp(\d+)_input$', path or "")
+    if not m:
+        return ""
+    hdir = os.path.dirname(path)
+    name = _read_text(os.path.join(hdir, "name"))
+    if not name:
+        return ""
+    dev = os.path.join(hdir, "device")
+    dev = os.path.basename(os.path.realpath(dev)) if os.path.exists(dev) else name
+    label = (_read_text(os.path.join(hdir, f"temp{m.group(1)}_label"))
+             or f"temp{m.group(1)}")
+    # Only characters apply-tempcomp.sh --sensor accepts in a pinned name
+    return re.sub(r'[^A-Za-z0-9 _.:#()+-]', '_', f"hwmon:{dev}:{label}")[:102]
+
+
+def list_temp_sensors(thermal_base: str = THERMAL_BASE,
+                      hwmon_base: str = HWMON_BASE) -> dict:
+    """{identity: path} of every temperature sensor reading plausibly.
+
+    Thermal zones, by the node zone_sensor_path() picks, and hwmon channels
+    that aren't a zone's mirror (coretemp's per-core and package channels, for
+    instance). The learning phase logs all of them.
+    """
+    lo, hi = SENSOR_PLAUSIBLE_RANGE_C
+    found = {}
+
+    def add(ident, path):
+        t = read_temperature(path)
+        if ident and ident not in found and t is not None and lo <= t / 1000.0 <= hi:
+            found[ident] = path
+
+    try:
+        zones = sorted((z for z in os.listdir(thermal_base)
+                        if z.startswith("thermal_zone")), key=_zone_number)
+    except OSError:
+        zones = []
+    for z in zones:
+        zone_dir = os.path.join(thermal_base, z)
+        add(_zone_identity(zone_dir), zone_sensor_path(zone_dir))
+    try:
+        hwmons = sorted((h for h in os.listdir(hwmon_base) if h.startswith("hwmon")),
+                        key=_zone_number)
+    except OSError:
+        hwmons = []
+    for h in hwmons:
+        hdir = os.path.join(hwmon_base, h)
+        if "/thermal_zone" in os.path.realpath(hdir):
+            continue                    # a zone's mirror, already listed
+        for node in sorted(glob.glob(os.path.join(hdir, "temp*_input")),
+                           key=lambda p: _zone_number(p[:-len("_input")])):
+            add(_hwmon_identity(node), node)
+    return found
+
+
+def sensor_label(identity: str) -> str:
+    """A short display name for a sensor identity."""
+    return identity.split(":", 1)[1] if identity.startswith(("type:", "hwmon:")) else identity
+
+
+def read_sensor_pin(pin_path: str = SENSOR_PIN_PATH) -> str:
+    """The sensor identity the learning phase chose, or ''."""
+    return _read_text(pin_path)
 
 
 SENSOR_READ_ERROR = "Could not read temperature"
@@ -652,6 +791,281 @@ class SensorSmoother:
         now = time.time() if now is None else now
         return self._published > 0 and now - self._published < 3 * SMOOTH_PUBLISH_S
 
+    def resume(self, now: float = None):
+        """Carry on from the value published before a monitor restart, so a
+        long smoothing doesn't start over from one raw reading."""
+        now = time.time() if now is None else now
+        try:
+            mtime = os.stat(self.path).st_mtime
+            with open(self.path) as f:
+                value = float(f.read().strip())
+        except (OSError, ValueError):
+            return
+        if now - mtime <= SMOOTH_GAP_S:
+            self.value, self._n, self._last = value, 1 << 30, mtime
+
+
+def _ema(ts: list, xs: list, tau_min: float, gap_s: float = LEARN_GAP_S) -> list:
+    """xs smoothed by an exponential filter, restarted across gaps."""
+    tau = tau_min * 60.0
+    out, s, last = [], None, None
+    for t, x in zip(ts, xs):
+        if s is None or t - last > gap_s:
+            s = x
+        else:
+            s += (1.0 - math.exp(-(t - last) / tau)) * (x - s)
+        out.append(s)
+        last = t
+    return out
+
+
+def _r2(model: tuple, xs: list, ys: list) -> float:
+    """Share of ys's variance a quadratic (T0, k0, k1, k2) explains."""
+    T0, k0, k1, k2 = model
+    my = sum(ys) / len(ys)
+    ss_res = sum((y - (k0 + k1 * (x - T0) + k2 * (x - T0) ** 2)) ** 2
+                 for x, y in zip(xs, ys))
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else float("-inf")
+
+
+def score_sensors(rows: list, sensors: list) -> list:
+    """Rank sensors by how well each predicts the raw frequency.
+
+    rows are (ts, raw freq, [millideg per sensor, None where unread]). For
+    each sensor and smoothing in LEARN_TAUS_MIN, fits frequency = quadratic
+    (temperature) on the older LEARN_TRAIN_SHARE of the minutes and scores it
+    on the rest: a sensor that only fits by chance, or that the crystal stopped
+    following, can't win that. Returns [(test R², identity, tau min, held-out
+    temperature range °C, full range °C)], best first.
+    """
+    results = []
+    for i, ident in enumerate(sensors):
+        pts = [(r[0], r[1], r[2][i]) for r in rows
+               if i < len(r[2]) and r[2][i] is not None]
+        if len(pts) < LEARN_MIN_COVERAGE * len(rows) or len(pts) < 60:
+            continue
+        ts = [p[0] for p in pts]
+        freqs = [p[1] for p in pts]
+        n_train = int(len(pts) * LEARN_TRAIN_SHARE)
+        best = None
+        for tau in LEARN_TAUS_MIN:
+            x = _ema(ts, [p[2] for p in pts], tau)
+            model = _polyfit_quadratic(x[:n_train], freqs[:n_train])
+            r2 = _r2(model, x[n_train:], freqs[n_train:])
+            if best is None or r2 > best[0]:
+                test = x[n_train:]
+                best = (r2, ident, tau, (max(test) - min(test)) / 1000.0,
+                        (max(x) - min(x)) / 1000.0)
+        results.append(best)
+    results.sort(key=lambda r: -r[0])
+    return results
+
+
+class SensorLearner:
+    """Logs every candidate sensor beside the raw frequency until one is chosen.
+
+    learning.csv holds one row a minute, `ts,freq,<millideg per sensor>`, under
+    a header naming the sensors; sensor_choice holds the decision,
+    `<identity>\\t<tau minutes>\\t<test R²>\\t<when>`, once made.
+    """
+
+    def __init__(self, data_dir: str, thermal_base: str = THERMAL_BASE,
+                 hwmon_base: str = HWMON_BASE):
+        self._path = os.path.join(data_dir, "learning.csv")
+        self._choice_path = os.path.join(data_dir, "sensor_choice")
+        self._data_dir = data_dir
+        self._thermal_base = thermal_base
+        self._hwmon_base = hwmon_base
+        self.sensors: list = []         # identities, the CSV's column order
+        self._paths: list = []
+        self.rows = deque()             # (ts, raw freq, [millideg or None])
+        self._sums: list = []
+        self._counts: list = []
+        self.choice: Optional[tuple] = None     # (identity, tau min, test R²)
+        self.ranking: list = []
+        self._scored_time: float = 0
+        self._scoring: Optional[threading.Thread] = None
+        self._pruned_time: float = 0
+
+    @property
+    def learning(self) -> bool:
+        return self.choice is None
+
+    def load(self):
+        """Read the decision, or the minutes logged so far."""
+        parts = _read_text(self._choice_path).split("\t")
+        if len(parts) >= 3:
+            try:
+                self.choice = (parts[0], float(parts[1]), float(parts[2]))
+                return
+            except ValueError:
+                pass
+        current = list_temp_sensors(self._thermal_base, self._hwmon_base)
+        self.sensors = list(current)
+        self._paths = list(current.values())
+        since = time.time() - LEARN_WINDOW_S
+        header = None
+        try:
+            with open(self._path) as f:
+                for line in f:
+                    parts = line.rstrip("\n").split(",")
+                    if parts[0] == "ts":
+                        header = parts[2:]
+                        continue
+                    if header is None or len(parts) != len(header) + 2:
+                        continue
+                    try:
+                        ts, freq = int(parts[0]), float(parts[1])
+                        vals = {h: float(v) for h, v in zip(header, parts[2:]) if v}
+                    except ValueError:
+                        continue
+                    if ts >= since:
+                        self.rows.append((ts, freq, [vals.get(s.replace(",", ";"))
+                                                     for s in self.sensors]))
+        except OSError:
+            pass
+        # The file's columns are rewritten to the sensors found now
+        if header != [s.replace(",", ";") for s in self.sensors]:
+            self._write()
+        self._start_minute()
+
+    def _start_minute(self):
+        self._sums = [0.0] * len(self.sensors)
+        self._counts = [0] * len(self.sensors)
+
+    def sample(self):
+        """Read every candidate; called each second while learning."""
+        for i, path in enumerate(self._paths):
+            t = read_temperature(path)
+            if t is not None:
+                self._sums[i] += t
+                self._counts[i] += 1
+
+    def close_minute(self, ts: int, raw_freq: float, keep: bool):
+        """End the minute; keep it only if chronyd's frequency was trusted."""
+        temps = [s / n if n else None for s, n in zip(self._sums, self._counts)]
+        self._start_minute()
+        if not keep or not self.sensors:
+            return
+        self.rows.append((ts, raw_freq, temps))
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            new = not os.path.exists(self._path)
+            with open(self._path, "a") as f:
+                if new:
+                    f.write(self._header())
+                f.write(self._line(ts, raw_freq, temps))
+        except OSError:
+            pass
+        if time.time() - self._pruned_time > 86400:
+            self._pruned_time = time.time()
+            since = ts - LEARN_WINDOW_S
+            while self.rows and self.rows[0][0] < since:
+                self.rows.popleft()
+            self._write()
+
+    def _header(self) -> str:
+        return ",".join(["ts", "freq"] + [s.replace(",", ";") for s in self.sensors]) + "\n"
+
+    @staticmethod
+    def _line(ts, freq, temps) -> str:
+        return ",".join([str(ts), f"{freq:.6f}"]
+                        + ["" if t is None else f"{t:.0f}" for t in temps]) + "\n"
+
+    def _write(self):
+        tmp = self._path + ".tmp"
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(tmp, "w") as f:
+                f.write(self._header())
+                for ts, freq, temps in self.rows:
+                    f.write(self._line(ts, freq, temps))
+            os.replace(tmp, self._path)
+        except OSError:
+            pass
+
+    def span_s(self) -> int:
+        return int(self.rows[-1][0] - self.rows[0][0]) if len(self.rows) >= 2 else 0
+
+    def due(self, now: float) -> bool:
+        return (self.learning and self.span_s() >= LEARN_SCORE_FROM_S
+                and now - self._scored_time >= LEARN_SCORE_S
+                and not (self._scoring and self._scoring.is_alive()))
+
+    def score(self, now: float, background: bool = True):
+        """Rank the sensors on the minutes so far, into self.ranking.
+
+        Scoring a week of a few dozen sensors takes seconds, so it runs in a
+        thread rather than stall the display.
+        """
+        self._scored_time = now
+        rows, sensors = list(self.rows), list(self.sensors)
+
+        def job():
+            self.ranking = score_sensors(rows, sensors)
+        if background:
+            self._scoring = threading.Thread(target=job, daemon=True)
+            self._scoring.start()
+        else:
+            job()
+
+    def winner(self, incumbent: str) -> Optional[tuple]:
+        """(identity, tau min, test R²) once the evidence suffices, else None.
+
+        The sensor in use is kept unless another beats it by LEARN_KEEP_MARGIN:
+        switching costs the fit its data's continuity for no real gain.
+        """
+        if (self.span_s() < LEARN_MIN_S or len(self.rows) < LEARN_MIN_MINUTES
+                or not self.ranking):
+            return None
+        best = self.ranking[0]
+        for r in self.ranking:
+            if r[1] == incumbent and r[0] >= best[0] - LEARN_KEEP_MARGIN:
+                best = r
+                break
+        r2, ident, tau, test_range, full_range = best
+        if (r2 < LEARN_MIN_TEST_R2 or test_range < LEARN_MIN_TEST_RANGE
+                or full_range < MIN_TEMP_RANGE_FIT):
+            return None
+        return ident, tau, r2
+
+    def fit_rows(self, ident: str, tau: float) -> list:
+        """(ts, smoothed millideg, raw freq) of the chosen sensor's minutes."""
+        if ident not in self.sensors:
+            return []
+        i = self.sensors.index(ident)
+        pts = [(r[0], r[2][i], r[1]) for r in self.rows if r[2][i] is not None]
+        smoothed = _ema([p[0] for p in pts], [p[1] for p in pts], tau)
+        return [(p[0], s, p[2]) for p, s in zip(pts, smoothed)]
+
+    def decide(self, ident: str, tau: float, r2: float):
+        self.choice = (ident, tau, r2)
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(self._choice_path, "w") as f:
+                f.write(f"{ident}\t{tau:g}\t{r2:.3f}\t{int(time.time())}\n")
+        except OSError:
+            pass
+        self.rows.clear()
+        try:
+            os.replace(self._path, self._path + ".decided")
+        except OSError:
+            pass
+
+    def reset(self):
+        """Forget the decision and the minutes: learn again from scratch."""
+        self.choice = None
+        self.ranking = []
+        self.rows.clear()
+        self._scored_time = 0
+        for p in (self._choice_path, self._path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        self.load()
+
 
 class TempCompCollector:
     """Collects temperature/frequency data for tempcomp calibration."""
@@ -659,7 +1073,9 @@ class TempCompCollector:
     def __init__(self, sensor_path: str = None,
                  data_dir: str = None, auto_recal: bool = True):
         # sensor_path=None (the default) means use the stable alias, or detect a
-        # concrete zone if it isn't published. An explicit path is honored as-is.
+        # concrete zone if it isn't published, and learn which sensor to keep.
+        # An explicit path is honored as-is.
+        learn = sensor_path is None and auto_recal
         if sensor_path is None:
             sensor_path = preferred_sensor_path()
         self.sensor_path = sensor_path
@@ -727,13 +1143,21 @@ class TempCompCollector:
         self._minute_chrony_comps = []
         self._comp_noise = deque(maxlen=COMP_NOISE_MINUTES)
 
+        # Learning phase: every candidate sensor logged until one is chosen
+        self.learner: Optional[SensorLearner] = SensorLearner(data_dir) if learn else None
+        self._smooth_tau = SMOOTH_TAU_S
+        self._resume_smoother = True        # only across a restart, same sensor
+        self._choice_pending = ""           # why the chosen sensor isn't in use yet
+
     def read_temperature(self) -> Optional[float]:
         """The temperature to record: the smoothed value while it's published
         (it's what chronyd then compensates with), else the sensor's own."""
         temp = read_temperature(self.sensor_path)
         if (self.smoother is None and self._smoothable
                 and os.path.isdir(os.path.dirname(SMOOTHED_TEMP_PATH))):
-            self.smoother = SensorSmoother()
+            self.smoother = SensorSmoother(tau=self._smooth_tau)
+            if self._resume_smoother:
+                self.smoother.resume()
         if temp is None or self.smoother is None:
             return temp
         smoothed = self.smoother.update(temp)
@@ -750,6 +1174,10 @@ class TempCompCollector:
         self._load_reported()
         if self._timestamps:
             self._last_sample_time = self._timestamps[-1]
+        if self.learner:
+            self.learner.load()
+            if self.learner.choice:
+                self._smooth_tau = max(SMOOTH_TAU_S, self.learner.choice[1] * 60)
 
     def _config_matches_sensor(self) -> bool:
         """True if chrony.conf's tempcomp uses the sensor we collect against.
@@ -890,6 +1318,11 @@ class TempCompCollector:
         self._last_sample_time = 0
         self._start_time = time.time()
         self._cached_correlation = None
+        if self.learner:
+            # The sensor and smoothing are chosen again from fresh evidence;
+            # the pin stays until then, and tempcomp is off meanwhile anyway
+            self.learner.reset()
+            self._choice_pending = ""
         if error:
             self._log_recal(f"Data reset by operator; tempcomp left on: {error}")
         else:
@@ -936,6 +1369,8 @@ class TempCompCollector:
                 raw_freq = frequency_ppm - comp
                 self._minute_chrony_comps.append(comp)
 
+        if self.learner and self.learner.learning:
+            self.learner.sample()
         self._minute_temps.append(temp_millideg)
         self._minute_freqs.append(raw_freq)
         self._minute_reported.append(frequency_ppm)
@@ -967,6 +1402,10 @@ class TempCompCollector:
 
             # Any untrusted second in the minute extends the settle window
             # past its end, so this drops that minute too.
+            if self.learner and self.learner.learning:
+                self.learner.close_minute(int(now), avg_freq,
+                                          keep=now > self._settle_until)
+                self._check_learning(now)
             if now <= self._settle_until:
                 return
 
@@ -1003,6 +1442,15 @@ class TempCompCollector:
 
         status.config = self._config
         status.sample_count = len(self._temps)
+        if self.learner:
+            if self.learner.learning:
+                status.learning_s = self.learner.span_s()
+                if self.learner.ranking:
+                    r2, ident, tau = self.learner.ranking[0][:3]
+                    status.learning_best = (sensor_label(ident), tau, r2)
+            else:
+                ident, tau = self.learner.choice[:2]
+                status.sensor_choice = (sensor_label(ident), tau)
         if len(self._timestamps) >= 2:
             status.collection_duration_s = int(self._timestamps[-1] - self._timestamps[0])
         elif self._start_time:
@@ -1124,6 +1572,89 @@ class TempCompCollector:
 
         return status
 
+    def _check_learning(self, now: float):
+        """Score the candidates now and then; choose once the evidence suffices."""
+        if self.learner.due(now):
+            self.learner.score(now)
+            return              # the winner is looked at once the score is in
+        if time.time() - self._last_attempt_time < LEARN_SCORE_S:
+            return              # a failed choice is retried at most hourly
+        win = self.learner.winner(sensor_identity(self.sensor_path))
+        if win:
+            self._choose_sensor(*win)
+
+    def _choose_sensor(self, ident: str, tau: float, r2: float):
+        """Make the learning phase's choice: point the stable link at the
+        sensor, refit from its logged minutes, and keep it until a reset."""
+        self._last_attempt_time = time.time()
+        incumbent = sensor_identity(self.sensor_path)
+        if ident != incumbent:
+            error = self._run_apply_helper("--sensor", ident)
+            self.sensor_path = preferred_sensor_path()
+            if error is None and sensor_identity(self.sensor_path) != ident:
+                # e.g. the root-owned resolver predates pins; the updater
+                # brings it up to date
+                error = f"the sensor link still reads {sensor_label(incumbent)}"
+            if error:
+                msg = f"Sensor choice {sensor_label(ident)} pending: {error}"
+                if msg != self._choice_pending:
+                    self._choice_pending = msg
+                    self._log_recal(msg)
+                return
+        self._choice_pending = ""
+
+        ranking = {r[1]: r[0] for r in self.learner.ranking}
+        rows = self.learner.fit_rows(ident, tau)
+        self.learner.decide(ident, tau, r2)
+
+        # The new smoothing starts over: the old value is another sensor's,
+        # or smoothed differently
+        self._smooth_tau = max(SMOOTH_TAU_S, tau * 60)
+        self.smoother = None
+        self._resume_smoother = False
+
+        # Fit data from now on is the chosen sensor's, smoothed as chronyd
+        # will read it; what was collected before is archived
+        self._archive(self._csv_path, time.strftime("prechoice-%Y%m%d-%H%M%S"))
+        if ident != incumbent:
+            self._archive(self._recal_log_path, incumbent)
+            self.recal_logs = []
+            for derived in (self._cal_range_path, self._cal_reversed_path):
+                try:
+                    os.remove(derived)
+                except OSError:
+                    pass
+            self._cal_range = None
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(self._sensor_meta_path, 'w') as f:
+                f.write(ident + '\n')
+        except OSError:
+            pass
+        self._reset_reported()
+        self._comp_noise.clear()
+        for d in (self._temps, self._freqs, self._timestamps):
+            d.clear()
+        for ts, temp, freq in rows[-MAX_SAMPLES:]:
+            self._timestamps.append(ts)
+            self._temps.append(temp)
+            self._freqs.append(freq)
+        self._rewrite_csv(list(zip(self._timestamps, self._temps, self._freqs)))
+        self._mark_csv_format()
+        self._cached_correlation = None
+
+        was = ranking.get(incumbent)
+        was = f"; {sensor_label(incumbent)} R2={was:.2f}" if (
+            was is not None and ident != incumbent) else ""
+        self._log_recal(f"Sensor chosen: {sensor_label(ident)}, smoothed "
+                        f"{tau:g} min (held-out R2={r2:.2f}{was})")
+
+        # Refit now, from the logged minutes, rather than a day from now
+        self._last_recal_time = 0
+        self._last_attempt_time = 0
+        if self.auto_recal:
+            self._check_recalibration()
+
     def _check_settled(self, now: float, trusted: bool):
         """Push the settle window out after lost lock or a chronyd (re)start."""
         if not trusted:
@@ -1145,6 +1676,9 @@ class TempCompCollector:
         # _repair_reversed_sign), or having none active at all (after a data
         # reset), which needn't wait out the cooldown -- though failed attempts
         # still do.
+        # No calibration until the learning phase has chosen what to fit to
+        if self.learner and self.learner.learning:
+            return
         now = time.time()
         cal_bad = (os.path.exists(self._cal_reversed_path)
                    or not (self._config and self._config.is_active))
@@ -1272,8 +1806,8 @@ class TempCompCollector:
             pass
         self._log_recal(f"Recalibrated: T0={T0:.0f} k1={k1:.6e} range={cal_min:.0f}-{cal_max:.0f}C")
 
-    def _run_apply_helper(self, arg: str) -> Optional[str]:
-        """Run apply-tempcomp.sh <arg> as root. None on success, else why not."""
+    def _run_apply_helper(self, *args: str) -> Optional[str]:
+        """Run apply-tempcomp.sh <args> as root. None on success, else why not."""
         # Prefer the root-owned installed copy: the sudoers NOPASSWD rule
         # authorizes exactly /usr/local/bin/apply-tempcomp.sh, so `sudo -n` only
         # succeeds for that path. The repo/source copy lives in a user-writable
@@ -1291,7 +1825,7 @@ class TempCompCollector:
         if not script:
             return "apply-tempcomp.sh not found"
         try:
-            proc = subprocess.run(["sudo", "-n", script, arg],
+            proc = subprocess.run(["sudo", "-n", script, *args],
                                   capture_output=True, text=True, timeout=30)
         except (subprocess.TimeoutExpired, OSError) as e:
             return str(e)
@@ -1720,21 +2254,39 @@ def _cli(argv=None) -> int:
              "loaded by udev, so at boot the good zone may not exist yet.")
     p.add_argument("--verbose", action="store_true",
                    help="Report the full ranking on stderr.")
+    p.add_argument("--list", action="store_true",
+                   help="List every candidate sensor (identity, path) and exit.")
     args = p.parse_args(argv)
 
+    if args.list:
+        for ident, path in list_temp_sensors().items():
+            print(f"{ident}\t{path}")
+        return 0
+
+    # The sensor the learning phase chose wins while it exists; at boot its
+    # driver may still be loading, so it gets the same wait.
+    pin = read_sensor_pin()
     deadline = time.monotonic() + max(0.0, args.wait_preferred)
     while True:
+        if pin:
+            path = list_temp_sensors().get(pin)
+            if path:
+                print(path)
+                return 0
         ranked = rank_temp_sensors()
         if args.verbose:
             for prio, path in ranked:
                 print(f"{prio:4d}  {path}  ({_zone_type_of(path) or 'unknown'})",
                       file=sys.stderr)
-        if ranked and ranked[0][0] <= PREFERRED_PRIORITY:
+        if ranked and ranked[0][0] <= PREFERRED_PRIORITY and not pin:
             break
         if time.monotonic() >= deadline:
             break
         time.sleep(0.5)
 
+    if pin:
+        print(f"warning: chosen sensor {pin} not found; using the ranking",
+              file=sys.stderr)
     if not ranked:
         print("no usable thermal zone found", file=sys.stderr)
         return 1

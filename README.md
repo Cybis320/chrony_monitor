@@ -112,6 +112,43 @@ journalctl -u chrony --since -10min | grep "Could not read temperature"   # must
 sudo scripts/setup-chronyd-apparmor.sh --dry-run
 ```
 
+### Choosing the sensor: the learning phase
+
+The type ranking only says where to start. Which sensor actually tracks the
+crystal depends on the board: on a dual-socket workstation both CPU packages
+report `x86_pkg_temp`, the ranking took the first, and it explained almost
+none of the drift on held-out data (R² 0.04) while the other socket's sensors
+explained most of it (0.77). So until it has evidence, the monitor doesn't
+calibrate. It logs every candidate sensor each minute, thermal zones and
+hwmon channels such as coretemp's per-core and package readings, beside the
+raw frequency (`learning.csv` in the data directory, a week at most).
+
+Every hour it scores each sensor, smoothed over 2, 5, 10, 20, 40 and
+80 minutes (the crystal heats and cools more slowly than a CPU die). It fits
+frequency = quadratic(temperature) on the older 60% of the minutes and scores
+the fit on the newer 40%. After 48 h and 1440 trusted minutes, it chooses the
+best sensor and smoothing, provided the winner explains at least half of the
+held-out variance, the held-out minutes span 2 °C, and all the minutes span
+5 °C. Otherwise it keeps learning. The sensor in use is kept unless another
+beats it by 0.03.
+
+The choice is then kept. `apply-tempcomp.sh --sensor` pins it in
+`/etc/chrony-monitor/tempcomp-sensor`, which the boot-time resolver honors ahead
+of the ranking. The fit data is replaced by the chosen sensor's logged minutes,
+smoothed the same way, and the monitor fits a calibration from them at once.
+From then on it smooths what chronyd reads with the chosen time constant. A
+data reset (`r`, then `y`) forgets the choice and learns again; the pin stays
+until the next choice.
+
+The TempComp line shows `learning 23h: best coretemp.1:Core 3 5m R2=0.81`
+while learning, and the chosen sensor and smoothing afterwards. To list the
+candidates and their identities:
+
+```bash
+python3 -m chrony_monitor.tempcomp --list
+cat /etc/chrony-monitor/tempcomp-sensor ~/.local/share/chrony-monitor/sensor_choice
+```
+
 ### Smoothed sensor input
 
 Some sensors, `x86_pkg_temp` among them, read in whole degrees and jump
@@ -125,8 +162,8 @@ So chronyd doesn't read the sensor itself. `chrony.conf` names
 `/run/chrony-monitor/tempcomp-input`, a link that points at either:
 
 - `/run/chrony-monitor/smoothed/temp`, which the running monitor writes every
-  5 s: the sensor read every second, exponentially smoothed over 2 minutes, in
-  the same millidegrees; or
+  5 s: the sensor read every second, exponentially smoothed over 2 minutes (or
+  the time constant the learning phase chose), in the same millidegrees; or
 - `/run/chrony-monitor/tempcomp-sensor`, the sensor itself, when the smoothed
   value is more than 2 minutes old: the monitor isn't running, or hasn't been
   started since boot.

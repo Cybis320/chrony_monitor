@@ -198,7 +198,7 @@ class Monitor:
         """Footer text that replaces the key hints: a pending question or a result."""
         now = time.time()
         if now < self._confirm_reset_until:
-            return "Reset TempComp (archive data, turn tempcomp off until refitted)? y = yes, any other key = no"
+            return "Reset TempComp (archive data, relearn the sensor, tempcomp off until refitted)? y = yes, any other key = no"
         if self._notice and now < self._notice[1]:
             return self._notice[0]
         return None
