@@ -130,7 +130,8 @@ the fit on the newer 40%. After 48 h and 1440 trusted minutes, it chooses the
 best sensor and smoothing, provided the winner explains at least half of the
 held-out variance, the held-out minutes span 2 °C, and all the minutes span
 5 °C. Otherwise it keeps learning. The sensor in use is kept unless another
-beats it by 0.03.
+beats it by 0.03, and a package or zone sensor is taken over a single core's
+within 0.05: a core's reading follows what is scheduled on that core.
 
 The choice is then kept. `apply-tempcomp.sh --sensor` pins it in
 `/etc/chrony-monitor/tempcomp-sensor`, which the boot-time resolver honors ahead
@@ -140,7 +141,7 @@ From then on it smooths what chronyd reads with the chosen time constant. A
 data reset (`r`, then `y`) forgets the choice and learns again; the pin stays
 until the next choice.
 
-The TempComp line shows `learning 23h: best coretemp.1:Core 3 5m R2=0.81`
+The TempComp line shows `learning 23h: best coretemp.1:Package id 1 2m R2=0.78`
 while learning, and the chosen sensor and smoothing afterwards. To list the
 candidates and their identities:
 

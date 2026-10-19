@@ -194,6 +194,17 @@ class LearnerTest(unittest.TestCase):
         lr.ranking = [(0.80, "type:a", 5, 3.0, 9.0), (0.70, "type:b", 2, 3.0, 9.0)]
         self.assertEqual(lr.winner("type:b")[0], "type:a")
 
+    def test_a_package_sensor_is_taken_over_a_core_when_close(self):
+        lr = tempcomp.SensorLearner(self.tmp.name)
+        lr.rows = deque(history(3000))
+        core, pkg = "hwmon:coretemp.1:Core 3", "hwmon:coretemp.1:Package id 1"
+        lr.ranking = [(0.815, core, 5, 3.6, 9.2), (0.775, pkg, 2, 3.8, 9.4),
+                      (0.774, "type:x86_pkg_temp#1", 2, 3.7, 9.3)]
+        self.assertEqual(lr.winner("type:x86_pkg_temp")[0], pkg)
+        lr.ranking[1] = (0.70, pkg, 2, 3.8, 9.4)
+        lr.ranking[2] = (0.69, "type:x86_pkg_temp#1", 2, 3.7, 9.3)
+        self.assertEqual(lr.winner("type:x86_pkg_temp")[0], core)
+
 
 class ChoiceTest(unittest.TestCase):
     """The collector stays off while learning, then pins, refits and keeps."""

@@ -86,6 +86,9 @@ LEARN_TRAIN_SHARE = 0.6         # fit on the older share, score on the rest
 LEARN_MIN_TEST_R2 = 0.5         # the winner must explain this much, held out
 LEARN_MIN_TEST_RANGE = 2.0      # °C, over the held-out minutes
 LEARN_KEEP_MARGIN = 0.03        # keep the sensor in use unless beaten by this
+# A single core's sensor follows what is scheduled on that core; the package
+# (or zone) reading averages the die, so it is taken over a core this close.
+LEARN_PACKAGE_MARGIN = 0.05
 LEARN_SCORE_S = 3600            # how often to score
 LEARN_SCORE_FROM_S = 12 * 3600  # interim scores for the display from here
 LEARN_GAP_S = 600               # restart the smoothing across a gap this long
@@ -862,6 +865,11 @@ def score_sensors(rows: list, sensors: list) -> list:
     return results
 
 
+def _per_core(identity: str) -> bool:
+    """A single CPU core's sensor, such as coretemp's 'Core 3'."""
+    return bool(re.search(r':Core \d+$', identity))
+
+
 class SensorLearner:
     """Logs every candidate sensor beside the raw frequency until one is chosen.
 
@@ -1010,20 +1018,34 @@ class SensorLearner:
         else:
             job()
 
-    def winner(self, incumbent: str) -> Optional[tuple]:
-        """(identity, tau min, test R²) once the evidence suffices, else None.
+    def preferred(self, incumbent: str) -> Optional[tuple]:
+        """The ranking's entry to choose, by score and then by kind.
 
         The sensor in use is kept unless another beats it by LEARN_KEEP_MARGIN:
-        switching costs the fit its data's continuity for no real gain.
+        switching costs the fit its data's continuity for no real gain. Failing
+        that, a package or zone sensor within LEARN_PACKAGE_MARGIN of the best
+        is taken over a single core's.
         """
-        if (self.span_s() < LEARN_MIN_S or len(self.rows) < LEARN_MIN_MINUTES
-                or not self.ranking):
+        if not self.ranking:
             return None
-        best = self.ranking[0]
+        top = self.ranking[0]
         for r in self.ranking:
-            if r[1] == incumbent and r[0] >= best[0] - LEARN_KEEP_MARGIN:
-                best = r
+            if r[1] == incumbent and r[0] >= top[0] - LEARN_KEEP_MARGIN:
+                return r
+        for r in self.ranking:
+            if r[0] < top[0] - LEARN_PACKAGE_MARGIN:
                 break
+            if not _per_core(r[1]):
+                return r
+        return top
+
+    def winner(self, incumbent: str) -> Optional[tuple]:
+        """(identity, tau min, test R²) once the evidence suffices, else None."""
+        if self.span_s() < LEARN_MIN_S or len(self.rows) < LEARN_MIN_MINUTES:
+            return None
+        best = self.preferred(incumbent)
+        if best is None:
+            return None
         r2, ident, tau, test_range, full_range = best
         if (r2 < LEARN_MIN_TEST_R2 or test_range < LEARN_MIN_TEST_RANGE
                 or full_range < MIN_TEMP_RANGE_FIT):
@@ -1445,8 +1467,9 @@ class TempCompCollector:
         if self.learner:
             if self.learner.learning:
                 status.learning_s = self.learner.span_s()
-                if self.learner.ranking:
-                    r2, ident, tau = self.learner.ranking[0][:3]
+                best = self.learner.preferred(sensor_identity(self.sensor_path))
+                if best:
+                    r2, ident, tau = best[:3]
                     status.learning_best = (sensor_label(ident), tau, r2)
             else:
                 ident, tau = self.learner.choice[:2]
