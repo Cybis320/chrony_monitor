@@ -424,6 +424,9 @@ install_legacy_desktop_file() {
     mkdir -p "$AUTOSTART_DIR"
     cp "$DESKTOP_FILE" "$AUTOSTART_DIR/chrony-monitor.desktop"
 
+    # Older hand-made autostart entries would start a second monitor
+    HOME="$TARGET_HOME" bash "$PROJECT_DIR/scripts/install-desktop.sh" --stale-autostart
+
     # Desktop shortcut
     DESKTOP_SHORTCUT="${TARGET_HOME}/Desktop/chrony-monitor.desktop"
     if [ -d "${TARGET_HOME}/Desktop" ]; then

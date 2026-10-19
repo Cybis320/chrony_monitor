@@ -14,7 +14,8 @@
 # Launchers: with --launchers (install.sh) they are (re)written to run from the
 # user checkout; without it (the daily update.sh) only when this run created
 # the checkout, which migrates installs whose launchers still point at /opt.
-# A launcher someone edited is otherwise never touched.
+# A launcher someone edited is otherwise never touched; every run still
+# disables other autostart entries that would start a second monitor.
 #
 # Exit status: 0 when the launchers run from the user checkout, non-zero when
 # they were not installed (install.sh then falls back to its own).
@@ -91,4 +92,6 @@ if [ ! -x "$DEST/scripts/install-desktop.sh" ]; then
 fi
 if [ "$LAUNCHERS" = "1" ]; then
     as_user bash "$DEST/scripts/install-desktop.sh"
+else
+    as_user bash "$DEST/scripts/install-desktop.sh" --stale-autostart
 fi
