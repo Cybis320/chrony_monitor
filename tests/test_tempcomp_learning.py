@@ -160,7 +160,8 @@ class LearnerTest(unittest.TestCase):
         with mock.patch.object(tempcomp.time, "time", return_value=START + 180):
             again.load()
         self.assertEqual([r[0] for r in again.rows], [START, START + 60])
-        self.assertEqual(again.rows[0][2], [40000, 38000])
+        self.assertEqual(list(again.rows[0][2]), [40000, 38000])
+        self.assertEqual(again.rows[0][2].typecode, "f")      # compact
 
     def test_a_new_sensor_gets_a_column_old_rows_lack(self):
         lr = tempcomp.SensorLearner(self.tmp.name)
@@ -171,7 +172,8 @@ class LearnerTest(unittest.TestCase):
         again = tempcomp.SensorLearner(self.tmp.name)
         with mock.patch.object(tempcomp.time, "time", return_value=START + 60):
             again.load()
-        self.assertEqual(again.rows[0][2], [40000, 38000, None])
+        self.assertEqual(list(again.rows[0][2])[:2], [40000, 38000])
+        self.assertTrue(math.isnan(again.rows[0][2][2]))
         with open(os.path.join(self.tmp.name, "learning.csv")) as f:
             self.assertEqual(f.readline().strip(), "ts,freq,type:a,type:b,type:c")
 
@@ -204,6 +206,33 @@ class LearnerTest(unittest.TestCase):
         lr.ranking[1] = (0.70, pkg, 2, 3.8, 9.4)
         lr.ranking[2] = (0.69, "type:x86_pkg_temp#1", 2, 3.7, 9.3)
         self.assertEqual(lr.winner("type:x86_pkg_temp")[0], core)
+
+    def test_a_better_sensor_is_reported_after_a_week_but_not_switched_to(self):
+        lr = tempcomp.SensorLearner(self.tmp.name)
+        lr.choice = ("type:b", 2, 0.7)
+        lr.rows = deque(history(10080 - 120))           # a week less 2 h
+        lr.sensors = ["type:a", "type:b"]
+        lr.ranking = [(0.85, "type:a", 5, 3.0, 9.0), (0.60, "type:b", 2, 3.0, 9.0)]
+        self.assertIsNone(lr.rival())
+        self.assertFalse(lr.due(0))
+        lr.rows = deque(history(10080))
+        self.assertEqual(lr.rival(), ("type:a", 0.85, 0.60))
+        self.assertTrue(lr.due(1e10))
+        lr.ranking[1] = (0.80, "type:b", 2, 3.0, 9.0)       # within the margin
+        self.assertIsNone(lr.rival())
+        self.assertEqual(lr.choice[0], "type:b")
+
+    def test_logging_continues_after_the_choice(self):
+        lr = tempcomp.SensorLearner(self.tmp.name)
+        lr.load()
+        lr.decide("type:a", 5, 0.8)
+        lr.sample()
+        lr.close_minute(START, 3.0, keep=True)
+        again = tempcomp.SensorLearner(self.tmp.name)
+        with mock.patch.object(tempcomp.time, "time", return_value=START + 60):
+            again.load()
+        self.assertEqual(again.choice[0], "type:a")
+        self.assertEqual(len(again.rows), 1)
 
 
 class ChoiceTest(unittest.TestCase):
@@ -289,13 +318,27 @@ class ChoiceTest(unittest.TestCase):
         self.assertEqual(len(self.c.learner.rows), 0)
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "sensor_choice")))
 
+    def test_a_rival_is_logged_once_and_shown(self):
+        self.score()
+        self.c.learner.rows = deque(history(10080))
+        self.c.learner.ranking = [(0.9, "type:b", 2, 3.0, 9.0),
+                                  (0.6, "type:a", 5, 3.0, 9.0)]
+        self.c.learner._scored_time = NOW
+        self.c._check_learning(NOW)
+        self.c._check_learning(NOW)
+        self.assertEqual(self.log().count("Sensor b fits better"), 1)
+        self.assertEqual(self.c.learner.choice[0], "type:a")
+        lines = display.format_tempcomp_lines(self.c.get_status())
+        self.assertIn("better sensor found", lines[0])
+        self.assertEqual(lines[2], "better: b R2=0.90 vs 0.60 (r to relearn)")
+
     def test_status_shows_learning_then_the_choice(self):
         self.c.learner.score(NOW, background=False)
         line2 = display.format_tempcomp_lines(self.c.get_status())[1]
-        self.assertIn("learning 49h: best a", line2)
+        self.assertTrue(line2.startswith("learning 49h: best a"), line2)
         self.c._check_learning(NOW)
         line2 = display.format_tempcomp_lines(self.c.get_status())[1]
-        self.assertRegex(line2, r"\ba (5|10|20)m\b")
+        self.assertRegex(line2, r"^sensor a, smoothed (5|10|20)m$")
 
 
 class KeepDataTest(unittest.TestCase):

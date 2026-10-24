@@ -141,9 +141,17 @@ From then on it smooths what chronyd reads with the chosen time constant. A
 data reset (`r`, then `y`) forgets the choice and learns again; the pin stays
 until the next choice.
 
-The TempComp line shows `learning 23h: best coretemp.1:Package id 1 2m R2=0.78`
-while learning, and the chosen sensor and smoothing afterwards. To list the
-candidates and their identities:
+Every candidate is still logged after the choice, and scored hourly on the last
+week. If another sensor beats the chosen one by 0.1 R² held out, the monitor
+logs it once, shows `better sensor found` and a `better:` line, and leaves the
+choice alone: whether to relearn is the operator's call, by a data reset.
+Logging all the sensors costs about 2 MB of disk and 3 MB of memory for a week
+of a dual-socket workstation's 28 sensors, and a second or two of a background
+thread an hour.
+
+The TempComp lines show `learning 23h: best coretemp.1:Package id 1 2m R2=0.78`
+while learning, and `sensor coretemp.0:Core 8, smoothed 5m` afterwards. To list
+the candidates and their identities:
 
 ```bash
 python3 -m chrony_monitor.tempcomp --list
@@ -186,16 +194,20 @@ which keeps the coefficients.
 
 The TempComp lines show two sides of it:
 
-- `raw R2=0.95` — how much of the crystal's drift temperature explains,
-  before correction. High means there is drift worth correcting. It is
-  computed on the raw frequency reconstructed from what chronyd reports, which
-  assumes the compensation is in effect as written, so it cannot tell you that
-  it is.
-- `after -0.01ppm/C R2=0.03 | wander -80%` — what chronyd actually reports
-  with the correction on, over the last day under the current calibration
-  (once there are 6 h of it spanning 2 °C). A working calibration leaves no
-  slope against temperature (R² near 0) and a frequency that wanders much less
-  than the raw one.
+- `uncorrected: R2=0.95 vs temp, 6402 min over 5d` — how much of the
+  crystal's drift temperature explains, before correction, over the fit data.
+  High means there is drift worth correcting. It is computed on the raw
+  frequency reconstructed from what chronyd reports, which assumes the
+  compensation is in effect as written, so it cannot tell you that it is.
+- `corrected: wander -80%, slope -0.01ppm/C R2=0.03` — what chronyd actually
+  reports with the correction on, over the last day under the current
+  calibration (once there are 6 h of it spanning 2 °C). `wander` is how much
+  less it varies than the raw frequency: the number that matters. `slope` is
+  what is left of the dependence on temperature, and its R² only how steadily
+  that slope holds, however small it is. So a high R² next to a small slope is
+  no cause for alarm, but a sizable slope with a high R² means the correction
+  is off: a positive slope where the raw one is negative means it
+  overcorrects, as a curve does outside the range it was fitted on.
 
 The monitor warns when that isn't so:
 

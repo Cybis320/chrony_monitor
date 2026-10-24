@@ -183,11 +183,18 @@ def format_us(us: float) -> str:
 
 
 def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
-    """Format temperature compensation as two lines."""
-    line1 = []
-    line2 = []
+    """Format temperature compensation as up to four lines, each short enough
+    to fit an 80-column terminal after the section label:
 
-    # Line 1: state, temp, range
+      Active 30-38C | 34.0C | <warning>
+      sensor coretemp.0:Core 8, smoothed 5m     (or: learning 23h: best ...)
+      better: coretemp.1:Package id 1 R2=0.81 vs 0.62 (r to relearn)
+      uncorrected: R2=0.63 vs temp, 6402 min over 5d
+      corrected: wander -40%, slope +0.10ppm/C R2=0.80
+    """
+    line1 = []
+
+    # Line 1: state, temp, range, warning
     if tc.config and tc.config.is_active:
         if tc.is_extrapolating and tc.cal_range:
             line1.append(f"OUTSIDE {tc.cal_range[0]:.0f}-{tc.cal_range[1]:.0f}C")
@@ -204,45 +211,54 @@ def format_tempcomp_lines(tc: TempCompStatus) -> tuple:
     if tc.current_temp_c is not None:
         line1.append(f"{tc.current_temp_c:.1f}C")
 
-    # How much of the raw drift temperature explains (before correction)
-    if tc.correlation is not None:
-        line1.append(f"raw R2={tc.correlation:.2f}")
-
     if tc.warning:
         line1.append(tc.warning)
+    elif tc.sensor_rival:
+        line1.append("better sensor found")
+    lines = [" | ".join(line1)]
 
-    # Line 2: collection stats
+    # Line 2: which sensor, still being learned or the one chosen
+    if tc.learning_s is not None:
+        best = ""
+        if tc.learning_best:
+            label, tau, r2 = tc.learning_best
+            best = f": best {label} {tau:g}m R2={r2:.2f}"
+        lines.append(f"learning {tc.learning_s // 3600}h{best}")
+    elif tc.sensor_choice:
+        lines.append(f"sensor {tc.sensor_choice[0]}, smoothed {tc.sensor_choice[1]:g}m")
+        if tc.sensor_rival:
+            label, r2, chosen = tc.sensor_rival
+            vs = "" if chosen is None else f" vs {chosen:.2f}"
+            lines.append(f"better: {label} R2={r2:.2f}{vs} (r to relearn)")
+
+    # Line 3: the fit data. R² is the share of the raw frequency's variance a
+    # curve in temperature explains: high means there is drift to correct.
     if tc.sample_count > 0:
         dur = tc.collection_duration_s
         if dur >= 2 * 86400:
-            dur_str = f"{dur // 86400}d"    # keeps line 2 inside 80 columns
+            dur_str = f"{dur // 86400}d"
         elif dur >= 3600:
             dur_str = f"{dur // 3600}h{(dur % 3600) // 60:02d}m"
         elif dur >= 60:
             dur_str = f"{dur // 60}m"
         else:
             dur_str = f"{dur}s"
-        line2.append(f"{tc.sample_count} samples ({dur_str})")
+        fit = f"R2={tc.correlation:.2f} vs temp, " if tc.correlation is not None else ""
+        lines.append(f"uncorrected: {fit}{tc.sample_count} min over {dur_str}")
 
-    # What chronyd reports with the correction on: a working one leaves no
-    # slope against temperature and less wander than the raw frequency
-    if tc.residual_slope is not None:
-        line2.append(f"after {tc.residual_slope:+.2f}ppm/C R2={tc.residual_r2:.2f}")
+    # Line 4: what chronyd reports with the correction on, since the last
+    # calibration. A working one wanders much less than the raw frequency and
+    # leaves little slope against temperature; the R² here is only how
+    # steadily what slope is left follows temperature, however small.
+    after = []
     if tc.wander_reduction is not None:
-        line2.append(f"wander {-100 * tc.wander_reduction:+.0f}%")
+        after.append(f"wander {-100 * tc.wander_reduction:+.0f}%")
+    if tc.residual_slope is not None:
+        after.append(f"slope {tc.residual_slope:+.2f}ppm/C R2={tc.residual_r2:.2f}")
+    if after:
+        lines.append("corrected: " + ", ".join(after))
 
-    # Which sensor: still being learned (first, so a long line doesn't clip
-    # it), or the one chosen
-    if tc.learning_s is not None:
-        best = ""
-        if tc.learning_best:
-            label, tau, r2 = tc.learning_best
-            best = f": best {label} {tau:g}m R2={r2:.2f}"
-        line2.insert(0, f"learning {tc.learning_s // 3600}h{best}")
-    elif tc.sensor_choice:
-        line2.append(f"{tc.sensor_choice[0]} {tc.sensor_choice[1]:g}m")
-
-    return " | ".join(line1), " | ".join(line2)
+    return tuple(lines)
 
 
 class Display:
@@ -300,15 +316,15 @@ class Display:
 
         # TempComp section
         if tempcomp_status is not None:
-            tc_line1, tc_line2 = format_tempcomp_lines(tempcomp_status)
+            tc_line1, *tc_more = format_tempcomp_lines(tempcomp_status)
             tc_attr = curses.A_DIM
             if tempcomp_status.is_extrapolating:
                 tc_attr = curses.color_pair(Color.YELLOW)
             row = self._render_section(row, w, "TempComp", tc_line1, tc_attr)
-            if tc_line2:
-                # Align with content column (same as _render_section)
-                content_col = 2 + self.LABEL_WIDTH + 5
-                self._addstr(row, content_col, tc_line2, curses.A_DIM)
+            # Align with content column (same as _render_section)
+            content_col = 2 + self.LABEL_WIDTH + 5
+            for line in tc_more:
+                self._addstr(row, content_col, line, curses.A_DIM)
                 row += 1
 
         # Lock lost timer (if applicable)

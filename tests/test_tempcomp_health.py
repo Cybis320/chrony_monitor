@@ -119,9 +119,9 @@ class ResidualTest(unittest.TestCase):
         s = tempcomp.TempCompStatus(sample_count=10, collection_duration_s=600,
                                     residual_slope=-0.195, residual_r2=0.84,
                                     wander_reduction=0.45)
-        _, line2 = display.format_tempcomp_lines(s)
-        self.assertEqual(line2, "10 samples (10m) | after -0.20ppm/C R2=0.84 "
-                                "| wander -45%")
+        lines = display.format_tempcomp_lines(s)
+        self.assertEqual(lines[1:], ("uncorrected: 10 min over 10m",
+                                     "corrected: wander -45%, slope -0.20ppm/C R2=0.84"))
 
 
 class StallTest(unittest.TestCase):

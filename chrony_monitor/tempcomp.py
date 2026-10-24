@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from array import array
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
@@ -101,6 +102,11 @@ LEARN_SCORE_S = 3600            # how often to score
 LEARN_SCORE_FROM_S = 12 * 3600  # interim scores for the display from here
 LEARN_GAP_S = 600               # restart the smoothing across a gap this long
 LEARN_MIN_COVERAGE = 0.95       # a sensor must have read in this share of minutes
+# After the choice every candidate is still logged, and a sensor that beats the
+# chosen one by this much over a full week is reported (never switched to: a
+# data reset relearns, at the operator's word)
+WATCH_MIN_S = LEARN_WINDOW_S - 3600
+WATCH_MARGIN = 0.1
 
 
 @dataclass
@@ -140,6 +146,9 @@ class TempCompStatus:
     learning_s: Optional[int] = None
     learning_best: Optional[tuple] = None
     sensor_choice: Optional[tuple] = None   # (label, tau minutes)
+    # A sensor that has beaten the chosen one over the last week: (label, its
+    # held-out R², the chosen one's or None)
+    sensor_rival: Optional[tuple] = None
 
 
 def read_temperature(sensor_path: str) -> Optional[float]:
@@ -856,6 +865,9 @@ class SensorSmoother:
             self.value, self._n, self._last = value, 1 << 30, mtime
 
 
+NAN = float("nan")
+
+
 def _ema(ts: list, xs: list, tau_min: float, gap_s: float = LEARN_GAP_S) -> list:
     """xs smoothed by an exponential filter, restarted across gaps."""
     tau = tau_min * 60.0
@@ -883,7 +895,7 @@ def _r2(model: tuple, xs: list, ys: list) -> float:
 def score_sensors(rows: list, sensors: list) -> list:
     """Rank sensors by how well each predicts the raw frequency.
 
-    rows are (ts, raw freq, [millideg per sensor, None where unread]). For
+    rows are (ts, raw freq, millideg per sensor, NaN or None where unread). For
     each sensor and smoothing in LEARN_TAUS_MIN, fits frequency = quadratic
     (temperature) on the older LEARN_TRAIN_SHARE of the minutes and scores it
     on the rest: a sensor that only fits by chance, or that the crystal stopped
@@ -893,7 +905,7 @@ def score_sensors(rows: list, sensors: list) -> list:
     results = []
     for i, ident in enumerate(sensors):
         pts = [(r[0], r[1], r[2][i]) for r in rows
-               if i < len(r[2]) and r[2][i] is not None]
+               if i < len(r[2]) and _read(r[2][i])]
         if len(pts) < LEARN_MIN_COVERAGE * len(rows) or len(pts) < 60:
             continue
         ts = [p[0] for p in pts]
@@ -913,13 +925,23 @@ def score_sensors(rows: list, sensors: list) -> list:
     return results
 
 
+def _read(v) -> bool:
+    """A logged reading: neither None nor NaN."""
+    return v is not None and v == v
+
+
 def _per_core(identity: str) -> bool:
     """A single CPU core's sensor, such as coretemp's 'Core 3'."""
     return bool(re.search(r':Core \d+$', identity))
 
 
 class SensorLearner:
-    """Logs every candidate sensor beside the raw frequency until one is chosen.
+    """Logs every candidate sensor beside the raw frequency: to choose one, and
+    once it is chosen, to report a sensor that has since done clearly better.
+
+    Each minute's readings are kept as a float32 array (NaN where a sensor
+    didn't read): a week of 28 sensors is about 3 MB, against 11 MB as lists
+    of Python floats.
 
     learning.csv holds one row a minute, `ts,freq,<millideg per sensor>`, under
     a header naming the sensors; sensor_choice holds the decision,
@@ -954,7 +976,6 @@ class SensorLearner:
         if len(parts) >= 3:
             try:
                 self.choice = (parts[0], float(parts[1]), float(parts[2]))
-                return
             except ValueError:
                 pass
         current = list_temp_sensors(self._thermal_base, self._hwmon_base)
@@ -977,8 +998,8 @@ class SensorLearner:
                     except ValueError:
                         continue
                     if ts >= since:
-                        self.rows.append((ts, freq, [vals.get(s.replace(",", ";"))
-                                                     for s in self.sensors]))
+                        self.rows.append((ts, freq, array("f", (
+                            vals.get(s.replace(",", ";"), NAN) for s in self.sensors))))
         except OSError:
             pass
         # The file's columns are rewritten to the sensors found now
@@ -1000,7 +1021,7 @@ class SensorLearner:
 
     def close_minute(self, ts: int, raw_freq: float, keep: bool):
         """End the minute; keep it only if chronyd's frequency was trusted."""
-        temps = [s / n if n else None for s, n in zip(self._sums, self._counts)]
+        temps = array("f", (s / n if n else NAN for s, n in zip(self._sums, self._counts)))
         self._start_minute()
         if not keep or not self.sensors:
             return
@@ -1027,7 +1048,7 @@ class SensorLearner:
     @staticmethod
     def _line(ts, freq, temps) -> str:
         return ",".join([str(ts), f"{freq:.6f}"]
-                        + ["" if t is None else f"{t:.0f}" for t in temps]) + "\n"
+                        + [f"{t:.0f}" if _read(t) else "" for t in temps]) + "\n"
 
     def _write(self):
         tmp = self._path + ".tmp"
@@ -1045,7 +1066,8 @@ class SensorLearner:
         return int(self.rows[-1][0] - self.rows[0][0]) if len(self.rows) >= 2 else 0
 
     def due(self, now: float) -> bool:
-        return (self.learning and self.span_s() >= LEARN_SCORE_FROM_S
+        enough = LEARN_SCORE_FROM_S if self.learning else WATCH_MIN_S
+        return (self.span_s() >= enough
                 and now - self._scored_time >= LEARN_SCORE_S
                 and not (self._scoring and self._scoring.is_alive()))
 
@@ -1105,9 +1127,20 @@ class SensorLearner:
         if ident not in self.sensors:
             return []
         i = self.sensors.index(ident)
-        pts = [(r[0], r[2][i], r[1]) for r in self.rows if r[2][i] is not None]
+        pts = [(r[0], r[2][i], r[1]) for r in self.rows if _read(r[2][i])]
         smoothed = _ema([p[0] for p in pts], [p[1] for p in pts], tau)
         return [(p[0], s, p[2]) for p, s in zip(pts, smoothed)]
+
+    def rival(self) -> Optional[tuple]:
+        """(identity, its R², the chosen sensor's R²) of a sensor that has
+        beaten the chosen one by WATCH_MARGIN over the last week, or None."""
+        if self.learning or self.span_s() < WATCH_MIN_S or not self.ranking:
+            return None
+        chosen = next((r[0] for r in self.ranking if r[1] == self.choice[0]), None)
+        other = next((r for r in self.ranking if r[1] != self.choice[0]), None)
+        if other is None or (chosen is not None and other[0] < chosen + WATCH_MARGIN):
+            return None
+        return other[1], other[0], chosen
 
     def decide(self, ident: str, tau: float, r2: float):
         self.choice = (ident, tau, r2)
@@ -1117,7 +1150,10 @@ class SensorLearner:
                 f.write(f"{ident}\t{tau:g}\t{r2:.3f}\t{int(time.time())}\n")
         except OSError:
             pass
+        # The watch judges the choice on minutes after it
         self.rows.clear()
+        self.ranking = []
+        self._scored_time = 0
         try:
             os.replace(self._path, self._path + ".decided")
         except OSError:
@@ -1218,6 +1254,7 @@ class TempCompCollector:
         self._smooth_tau = SMOOTH_TAU_S
         self._resume_smoother = True        # only across a restart, same sensor
         self._choice_pending = ""           # why the chosen sensor isn't in use yet
+        self._rival_logged = ""             # the better sensor last logged
 
     def read_temperature(self) -> Optional[float]:
         """The temperature to record: the smoothed value while it's published
@@ -1439,7 +1476,7 @@ class TempCompCollector:
                 raw_freq = frequency_ppm - comp
                 self._minute_chrony_comps.append(comp)
 
-        if self.learner and self.learner.learning:
+        if self.learner:
             self.learner.sample()
         self._minute_temps.append(temp_millideg)
         self._minute_freqs.append(raw_freq)
@@ -1472,7 +1509,7 @@ class TempCompCollector:
 
             # Any untrusted second in the minute extends the settle window
             # past its end, so this drops that minute too.
-            if self.learner and self.learner.learning:
+            if self.learner:
                 self.learner.close_minute(int(now), avg_freq,
                                           keep=now > self._settle_until)
                 self._check_learning(now)
@@ -1522,6 +1559,9 @@ class TempCompCollector:
             else:
                 ident, tau = self.learner.choice[:2]
                 status.sensor_choice = (sensor_label(ident), tau)
+                rival = self.learner.rival()
+                if rival:
+                    status.sensor_rival = (sensor_label(rival[0]), rival[1], rival[2])
         if len(self._timestamps) >= 2:
             status.collection_duration_s = int(self._timestamps[-1] - self._timestamps[0])
         elif self._start_time:
@@ -1649,6 +1689,17 @@ class TempCompCollector:
         if self.learner.due(now):
             self.learner.score(now)
             return              # the winner is looked at once the score is in
+        if not self.learner.learning:
+            # Chosen: only report a sensor that has since done clearly better
+            rival = self.learner.rival()
+            name = rival[0] if rival else ""
+            if name and name != self._rival_logged:
+                chosen = "unscored" if rival[2] is None else f"{rival[2]:.2f}"
+                self._log_recal(f"Sensor {sensor_label(name)} fits better than the "
+                                f"chosen one over the last week (held-out R2="
+                                f"{rival[1]:.2f} vs {chosen}); reset to relearn")
+            self._rival_logged = name
+            return
         if time.time() - self._last_attempt_time < LEARN_SCORE_S:
             return              # a failed choice is retried at most hourly
         win = self.learner.winner(sensor_identity(self.sensor_path))
