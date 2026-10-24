@@ -89,6 +89,14 @@ LEARN_KEEP_MARGIN = 0.03        # keep the sensor in use unless beaten by this
 # A single core's sensor follows what is scheduled on that core; the package
 # (or zone) reading averages the die, so it is taken over a core this close.
 LEARN_PACKAGE_MARGIN = 0.05
+
+# Glitch filter: a minute is dropped when its frequency is further from the
+# median of the minutes within OUTLIER_WINDOW_S than 3 interquartile ranges of
+# such deviations, and at least OUTLIER_MIN_PPM.
+OUTLIER_WINDOW_S = 1800
+OUTLIER_MIN_PPM = 0.15
+# The display's raw R² fits all the data; it needn't follow every minute
+CORRELATION_REFRESH_S = 600
 LEARN_SCORE_S = 3600            # how often to score
 LEARN_SCORE_FROM_S = 12 * 3600  # interim scores for the display from here
 LEARN_GAP_S = 600               # restart the smoothing across a gap this long
@@ -731,23 +739,63 @@ def _center_compensation(temps: list, T0: float, k0: float, k1: float,
     return k0 - (lo + hi) / 2, (hi - lo) / 2
 
 
-def _filter_outliers(temps: list, freqs: list) -> tuple:
-    """Remove frequency outliers using IQR method.
+def _median(xs) -> float:
+    xs = sorted(xs)
+    return xs[len(xs) // 2]
 
-    Returns filtered (temps, freqs) lists with outliers removed.
+
+def _outlier_mask(timestamps, freqs: list) -> list:
+    """True for each minute to keep: all but those whose frequency jumps away
+    from the minutes around it.
+
+    A glitch (a bad frequency estimate from chronyd) stands out from its
+    neighbours; a temperature excursion moves them all. Judged against the
+    whole data set's spread instead, as this once was, a cold day's minutes
+    were all "outliers": on the Z840 the filter dropped 588 of 996 minutes of
+    a day the room cooled 6 °C, exactly the ones that calibration needed.
     """
-    if len(freqs) < 20:
-        return temps, freqs
-    freqs_sorted = sorted(freqs)
-    q1 = freqs_sorted[len(freqs_sorted) // 4]
-    q3 = freqs_sorted[3 * len(freqs_sorted) // 4]
+    n = len(freqs)
+    if n < 20:
+        return [True] * n
+    if timestamps is None or len(timestamps) != n:
+        timestamps = range(0, 60 * n, 60)
+    # Each minute's deviation from the minutes within OUTLIER_WINDOW_S, along
+    # their trend: the median of their frequencies carried to its time by the
+    # slope between the medians of the window's first and last thirds. Without
+    # the trend, the newest minutes, which only have older neighbours, would
+    # look like jumps whenever the temperature moves fast.
+    dev = []
+    lo = hi = 0
+    for i in range(n):
+        while hi < n and timestamps[hi] <= timestamps[i] + OUTLIER_WINDOW_S:
+            hi += 1
+        while timestamps[lo] < timestamps[i] - OUTLIER_WINDOW_S:
+            lo += 1
+        third = max(1, (hi - lo) // 3)
+        t1, t3 = timestamps[lo + third // 2], timestamps[hi - 1 - third // 2]
+        slope = 0.0
+        if t3 > t1:
+            slope = (_median(freqs[hi - third:hi]) - _median(freqs[lo:lo + third])) / (t3 - t1)
+        ti = timestamps[i]
+        dev.append(freqs[i] - _median([freqs[j] + slope * (ti - timestamps[j])
+                                       for j in range(lo, hi)]))
+    ds = sorted(dev)
+    q1, q3 = ds[n // 4], ds[3 * n // 4]
     iqr = q3 - q1
-    lower = q1 - 3.0 * iqr
-    upper = q3 + 3.0 * iqr
-    filtered = [(t, f) for t, f in zip(temps, freqs) if lower <= f <= upper]
-    if not filtered:
-        return temps, freqs
-    return [t for t, f in filtered], [f for t, f in filtered]
+    lower = min(q1 - 3.0 * iqr, -OUTLIER_MIN_PPM)
+    upper = max(q3 + 3.0 * iqr, OUTLIER_MIN_PPM)
+    return [lower <= d <= upper for d in dev]
+
+
+def _filter_outliers(temps: list, freqs: list, timestamps=None) -> tuple:
+    """(temps, freqs) without the minutes _outlier_mask rejects.
+
+    timestamps, in order, place each minute among its neighbours; without
+    them the minutes are taken to be consecutive.
+    """
+    keep = _outlier_mask(timestamps, freqs)
+    return ([t for t, k in zip(temps, keep) if k],
+            [f for f, k in zip(freqs, keep) if k])
 
 
 class SensorSmoother:
@@ -1259,7 +1307,7 @@ class TempCompCollector:
         except OSError:
             pass
 
-        if prev and not prev.startswith(("type:", "path:")):
+        if prev and not prev.startswith(("type:", "hwmon:", "path:")):
             # Written by the first version of this check, which stored a bare
             # path. Resolve it to an identity so an unchanged sensor is
             # recognized. (If the zone renumbered since, the type at that index
@@ -1502,8 +1550,9 @@ class TempCompCollector:
             if (len(self._temps) >= MIN_SAMPLES_CORRELATION
                     and temp_range_c >= MIN_TEMP_RANGE_CORRELATION):
                 now = time.time()
-                if self._cached_correlation is None or now - self._correlation_time > 60:
-                    temps_md, freqs = _filter_outliers(list(self._temps), list(self._freqs))
+                if self._cached_correlation is None or now - self._correlation_time > CORRELATION_REFRESH_S:
+                    temps_md, freqs = _filter_outliers(list(self._temps), list(self._freqs),
+                                     list(self._timestamps))
                     if len(freqs) >= MIN_SAMPLES_CORRELATION:
                         T0, k0, k1, k2 = _polyfit_quadratic(temps_md, freqs)
                         predicted = [k0 + k1 * (t - T0) + k2 * (t - T0) ** 2
@@ -1722,7 +1771,8 @@ class TempCompCollector:
         # Compute new fit from raw data (outliers filtered). chronyd reports
         # raw + comp, so the compensation that flattens it is the fitted raw
         # curve negated.
-        temps_md, freqs = _filter_outliers(list(self._temps), list(self._freqs))
+        temps_md, freqs = _filter_outliers(list(self._temps), list(self._freqs),
+                                     list(self._timestamps))
         if len(freqs) < MIN_SAMPLES_FIT:
             return
         new_T0, a0, a1, a2 = _polyfit_quadratic(temps_md, freqs)
@@ -2137,16 +2187,11 @@ class TempCompCollector:
         elif repaired:
             raw_rows = self._undo_uncompensated_repair(raw_rows)
 
-        # Filter outliers using IQR on frequency
+        # Glitches are left in, and filtered out of each fit instead: whether
+        # a minute stands out depends on the minutes around it, and the newest
+        # don't have their later neighbours yet. (Dropping them here, against
+        # the whole data set's spread, once deleted a cold day's minutes.)
         rows_to_keep = raw_rows
-        if len(raw_rows) >= 20:
-            freqs_sorted = sorted(r[2] for r in raw_rows)
-            q1 = freqs_sorted[len(freqs_sorted) // 4]
-            q3 = freqs_sorted[3 * len(freqs_sorted) // 4]
-            iqr = q3 - q1
-            lower = q1 - 3.0 * iqr
-            upper = q3 + 3.0 * iqr
-            rows_to_keep = [r for r in raw_rows if lower <= r[2] <= upper]
 
         for ts, temp, freq in rows_to_keep:
             self._timestamps.append(ts)

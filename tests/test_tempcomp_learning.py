@@ -298,6 +298,50 @@ class ChoiceTest(unittest.TestCase):
         self.assertRegex(line2, r"\ba (5|10|20)m\b")
 
 
+class KeepDataTest(unittest.TestCase):
+    """Two ways the chosen sensor's data was being thrown away."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def collector(self):
+        c = tempcomp.TempCompCollector(
+            sensor_path=os.path.join(self.tmp.name, "link"),
+            data_dir=self.tmp.name, auto_recal=False)
+        return c
+
+    def test_a_chosen_hwmon_sensor_is_not_taken_for_a_change(self):
+        write(os.path.join(self.tmp.name, "sensor"), "hwmon:coretemp.0:Core 8")
+        write(os.path.join(self.tmp.name, "tempcomp.csv"), f"{START},33000,3.2")
+        with mock.patch.object(tempcomp, "sensor_identity",
+                               return_value="hwmon:coretemp.0:Core 8"):
+            self.collector()._invalidate_data_if_sensor_changed()
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "tempcomp.csv")))
+
+    def test_a_cold_day_is_kept_and_a_glitch_is_not(self):
+        # Five steady days at 3.2 ppm, then a day the room cools and the
+        # frequency climbs smoothly by 1.3 ppm, with a one-minute glitch
+        ts = [START + 60 * i for i in range(7200)]
+        freqs = [3.2] * 5760 + [3.2 + 1.3 * min(1, i / 600) for i in range(1440)]
+        freqs = [f + 0.003 * math.sin(i) for i, f in enumerate(freqs)]
+        freqs[3000] -= 0.5
+        keep = tempcomp._outlier_mask(ts, freqs)
+        self.assertFalse(keep[3000])
+        self.assertTrue(all(keep[5760:]))
+        # and none of it is deleted from disk at startup
+        with open(os.path.join(self.tmp.name, "tempcomp.csv"), "w") as f:
+            for t, fr in zip(ts, freqs):
+                f.write(f"{t},30000,{fr:.6f}\n")
+        tempcomp.TempCompCollector._mark_csv_format(self.collector())
+        with mock.patch.object(tempcomp.time, "time", return_value=ts[-1]):
+            c = self.collector()
+            c._load_csv()
+        self.assertEqual(len(c._freqs), 7200)
+        with open(os.path.join(self.tmp.name, "tempcomp.csv")) as f:
+            self.assertEqual(sum(1 for _ in f), 7200)
+
+
 class PinHelperTest(unittest.TestCase):
     def run_helper(self, ident):
         return subprocess.run(["bash", os.path.join(SCRIPTS, "apply-tempcomp.sh"),
